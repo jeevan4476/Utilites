@@ -1,0 +1,7 @@
+{
+  "name": "rclip Watcher",
+  "description": "Background clipboard capture extension for rclip on GNOME Wayland",
+  "uuid": "rclip-watcher@utilities.local",
+  "shell-version": ["45", "46", "47", "48", "49", "50"],
+  "version": 1
+}
