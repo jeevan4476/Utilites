@@ -1,0 +1,3 @@
+[D-BUS Service]
+Name=io.github.rclip
+Exec=/home/img1/.local/bin/rclip daemon
