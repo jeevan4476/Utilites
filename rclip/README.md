@@ -1,47 +1,42 @@
-# rclip — Lightweight Wayland Clipboard Manager
+# rclip — Windows `Win + V` Style Clipboard Manager for GNOME Wayland
 
-`rclip` is an ultra-lightweight, memory-efficient clipboard history manager written in Rust with a native GTK4 floating card interface designed for GNOME on Wayland (Fedora).
+`rclip` is a native GNOME Shell (45–51) clipboard overlay + CLI companion that replicates Windows `Win + V` behavior on Fedora Workstation / GNOME Wayland with zero GTK4 window glitches and zero root permissions.
 
 ## Key Features
-- **Ultra-compact binary**: Stripped release binary with LTO (`opt-level = "z"`).
-- **Fast D-Bus Activation**: Seamlessly activated via standard D-Bus actions with instant Wayland window focus forwarding.
-- **Wayland Background Capture**: Captures clipboard updates across all applications using an integrated GNOME Shell extension and GdkClipboard watcher.
-- **Privacy & Password Protection**: Automatically skips clips marked with `x-kde-passwordManagerHint` (e.g. 1Password, Bitwarden, KeePassXC).
-- **Secure Persistence**: Atomic file writes with `0o700` directory and `0o600` file permissions and `fsync`.
-- **Pinned History**: Pin favorite clips with <kbd>Ctrl</kbd>+<kbd>P</kbd>; pinned clips appear first and are never pruned.
-- **Fuzzy Search**: Real-time fuzzy filtering powered by `nucleo-matcher` with substring fallback.
+- **Instant `Super + V` Overlay:** Renders natively inside GNOME Shell right near your cursor, clamped to the current monitor work area, and dismisses automatically when you click outside or press `Esc`.
+- **Text + Images with Thumbnails:** Captures text, URLs, code, and copied PNG images/screenshots with thumbnail previews, dimensions, and relative timestamps.
+- **True Auto-Paste:** Selecting a clip (`Enter` or single click) restores focus to your previous window, updates the clipboard, and injects `Ctrl+V` (or `Ctrl+Shift+V` in terminals like Ptyxis, GNOME Terminal, Alacritty, Kitty, WezTerm, Foot, Konsole).
+- **Pin, Search, & Clear All:** Real-time search box, `★` pinning (`Ctrl+P`), single-item delete (`Ctrl+D` / `Delete`), and a **`Clear all`** header button that preserves pinned items.
+- **Privacy & Security:** Automatically ignores copies flagged with `x-kde-passwordManagerHint` (1Password, Bitwarden, KeePassXC) and stores data with `0o700` directory / `0o600` file permissions.
 
 ## Keyboard Controls
 | Shortcut | Action |
 |---|---|
-| <kbd>Super</kbd> + <kbd>V</kbd> | Toggle clipboard popup at cursor / center |
-| <kbd>↑</kbd> / <kbd>↓</kbd> | Navigate clipboard items |
-| <kbd>Enter</kbd> | Copy selected item to clipboard and close window |
-| <kbd>Ctrl</kbd> + <kbd>P</kbd> | Toggle pin on highlighted item |
-| <kbd>Ctrl</kbd> + <kbd>D</kbd> | Delete highlighted item from history |
-| <kbd>Escape</kbd> | Close popup without copying |
+| <kbd>Super</kbd> + <kbd>V</kbd> | Toggle clipboard popup at cursor |
+| <kbd>↑</kbd> / <kbd>↓</kbd> | Navigate items (auto-scrolls list) |
+| <kbd>Enter</kbd> or Click | Paste selected item into previous window |
+| <kbd>Ctrl</kbd> + <kbd>P</kbd> | Pin / unpin selected item |
+| <kbd>Ctrl</kbd> + <kbd>D</kbd> | Delete selected item |
+| <kbd>Esc</kbd> or Click outside | Close popup |
 
 ## CLI Commands
 ```bash
-rclip toggle          # Toggle popup visibility (default)
-rclip show            # Open popup
-rclip hide            # Close popup
-rclip clear           # Clear all unpinned history
-rclip daemon          # Run in background daemon service mode
-rclip add-clip "text" # Add text directly to history
-```
-
-## Configuration
-`~/.config/rclip/config.json`:
-```json
-{
-  "max_items": 100,
-  "max_clip_bytes": 1000000
-}
+rclip toggle   # Toggle popup via D-Bus
+rclip show     # Show popup
+rclip hide     # Hide popup
+rclip clear    # Clear unpinned history (keeps pinned)
+rclip list     # List saved text & image clips (--json supported)
+rclip status   # Show history path, item count, and extension status
 ```
 
 ## Installation
 ```bash
 ./install.sh
 ```
-Builds the release binary, installs it to `~/.local/bin/rclip`, installs the D-Bus service & desktop file, copies the GNOME Shell extension, and binds <kbd>Super</kbd>+<kbd>V</kbd>.
+Installs `rclip@utilities.local` into `~/.local/share/gnome-shell/extensions/`, compiles its GSettings schema for `<Super>v`, installs `~/.local/bin/rclip`, and cleans up any legacy `rclip-watcher` setup. On Wayland, log out and back in once so GNOME Shell loads the new extension.
+
+## Tests
+```bash
+gjs -m tests/test_store.mjs
+PYTHONPATH=. python3 -m unittest discover -s tests -v
+```

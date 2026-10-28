@@ -1,0 +1,8 @@
+{
+  "name": "rclip Clipboard Manager",
+  "description": "Windows Win+V style clipboard manager with text & image history and auto-paste on GNOME Wayland",
+  "uuid": "rclip@utilities.local",
+  "settings-schema": "org.gnome.shell.extensions.rclip",
+  "shell-version": ["45", "46", "47", "48", "49", "50", "51"],
+  "version": 2
+}

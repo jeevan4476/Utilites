@@ -1,40 +1,54 @@
 #!/usr/bin/env bash
-set -e
+set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-cd "$SCRIPT_DIR"
+EXT_UUID="rclip@utilities.local"
+EXT_DIR="${HOME}/.local/share/gnome-shell/extensions/${EXT_UUID}"
+OLD_EXT_DIR="${HOME}/.local/share/gnome-shell/extensions/rclip-watcher@utilities.local"
+INSTALL_BIN="${HOME}/.local/bin"
 
-echo "==> Building rclip (release)..."
-cargo build --release
-
-BIN_PATH="$SCRIPT_DIR/target/release/rclip"
-INSTALL_BIN="$HOME/.local/bin"
+echo "==> Installing rclip CLI to ${INSTALL_BIN}/rclip..."
 mkdir -p "$INSTALL_BIN"
-cp "$BIN_PATH" "$INSTALL_BIN/rclip"
-echo "==> Installed binary to $INSTALL_BIN/rclip"
+cat > "${INSTALL_BIN}/rclip" <<EOF
+#!/usr/bin/env bash
+PYTHONPATH="${SCRIPT_DIR}\${PYTHONPATH:+:\$PYTHONPATH}" exec python3 -m rclip_cli.cli "\$@"
+EOF
+chmod +x "${INSTALL_BIN}/rclip"
 
-# D-Bus service & desktop file
-mkdir -p "$HOME/.local/share/applications"
-mkdir -p "$HOME/.local/share/dbus-1/services"
+echo "==> Cleaning up legacy rclip daemon / watcher artifacts..."
+if command -v gnome-extensions >/dev/null 2>&1; then
+    gnome-extensions disable rclip-watcher@utilities.local >/dev/null 2>&1 || true
+fi
+rm -rf "$OLD_EXT_DIR"
+rm -f "${HOME}/.local/share/dbus-1/services/io.github.rclip.service"
+rm -f "${HOME}/.local/share/applications/io.github.rclip.desktop"
 
-# Update Exec path in service file to point to $HOME/.local/bin/rclip
-sed "s|Exec=.*|Exec=$HOME/.local/bin/rclip daemon|" "$SCRIPT_DIR/io.github.rclip.service" > "$HOME/.local/share/dbus-1/services/io.github.rclip.service"
-cp "$SCRIPT_DIR/io.github.rclip.desktop" "$HOME/.local/share/applications/io.github.rclip.desktop"
-echo "==> Installed D-Bus activation service and desktop entry"
-
-# GNOME Shell extension for background clipboard capture on Wayland
-EXT_DIR="$HOME/.local/share/gnome-shell/extensions/rclip-watcher@utilities.local"
-mkdir -p "$EXT_DIR"
-cp -r "$SCRIPT_DIR/gnome-extension/"* "$EXT_DIR/"
-echo "==> Installed GNOME Shell watcher extension to $EXT_DIR"
-
-# Configure GNOME shortcut for Super+V
+# Remove legacy custom1 <Super>v keybinding created by v1 if it points to rclip
 if command -v gsettings >/dev/null 2>&1; then
     CUSTOM_KEY="/org/gnome/settings-daemon/plugins/media-keys/custom-keybindings/custom1/"
-    gsettings set "org.gnome.settings-daemon.plugins.media-keys.custom-keybinding:$CUSTOM_KEY" name 'rclip Clipboard'
-    gsettings set "org.gnome.settings-daemon.plugins.media-keys.custom-keybinding:$CUSTOM_KEY" command "$HOME/.local/bin/rclip toggle"
-    gsettings set "org.gnome.settings-daemon.plugins.media-keys.custom-keybinding:$CUSTOM_KEY" binding '<Super>v'
-    echo "==> Configured <Super>+V shortcut to '$HOME/.local/bin/rclip toggle'"
+    EXISTING_CMD="$(gsettings get "org.gnome.settings-daemon.plugins.media-keys.custom-keybinding:${CUSTOM_KEY}" command 2>/dev/null || true)"
+    if [[ "$EXISTING_CMD" == *rclip* ]]; then
+        gsettings reset "org.gnome.settings-daemon.plugins.media-keys.custom-keybinding:${CUSTOM_KEY}" name || true
+        gsettings reset "org.gnome.settings-daemon.plugins.media-keys.custom-keybinding:${CUSTOM_KEY}" command || true
+        gsettings reset "org.gnome.settings-daemon.plugins.media-keys.custom-keybinding:${CUSTOM_KEY}" binding || true
+        echo "==> Cleared legacy custom1 <Super>v shortcut"
+    fi
+fi
+
+echo "==> Installing GNOME Shell extension (${EXT_UUID})..."
+mkdir -p "$EXT_DIR"
+cp -r "${SCRIPT_DIR}/extension/"* "$EXT_DIR/"
+
+if command -v glib-compile-schemas >/dev/null 2>&1; then
+    glib-compile-schemas "${EXT_DIR}/schemas"
+else
+    echo "Warning: glib-compile-schemas not found; extension settings schema was not compiled." >&2
+fi
+
+if command -v gnome-extensions >/dev/null 2>&1; then
+    gnome-extensions enable "$EXT_UUID" >/dev/null 2>&1 || true
 fi
 
 echo "==> Installation complete!"
+echo "    On Wayland, log out and log back in once so GNOME Shell loads '${EXT_UUID}'."
+echo "    Then press Super+V anywhere to open and auto-paste."

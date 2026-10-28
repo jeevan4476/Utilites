@@ -1,0 +1,10 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<schemalist>
+  <schema id="org.gnome.shell.extensions.rclip" path="/org/gnome/shell/extensions/rclip/">
+    <key name="toggle-popup" type="as">
+      <default>['&lt;Super&gt;v']</default>
+      <summary>Toggle clipboard popup</summary>
+      <description>Global shortcut to open and close the rclip clipboard history overlay.</description>
+    </key>
+  </schema>
+</schemalist>
