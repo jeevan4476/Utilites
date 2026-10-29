@@ -45,7 +45,7 @@ export const RclipPopup = GObject.registerClass(
         _init(store, onPasteItem) {
             super._init({
                 style_class: 'rclip-popup',
-                vertical: true,
+                orientation: Clutter.Orientation.VERTICAL,
                 reactive: true,
                 visible: false,
             });
@@ -53,10 +53,24 @@ export const RclipPopup = GObject.registerClass(
             this._store = store;
             this._onPasteItem = onPasteItem;
             this._modalGrab = null;
-            this._stageEventId = 0;
             this._filtered = [];
             this._cards = [];
             this._selectedIdx = 0;
+
+            this._keyController = new Clutter.KeyController();
+            this._keyController.connect('key-press', () => this._onKeyPress());
+
+            this._clickOutsideGesture = new Clutter.ClickGesture({
+                recognize_on_press: true,
+            });
+            this._clickOutsideGesture.connect('may-recognize', () => {
+                const event = this._clickOutsideGesture.get_point_event(0);
+                const targetActor = event ? global.stage.get_event_actor(event) : null;
+                return !this.contains(targetActor);
+            });
+            this._clickOutsideGesture.connect('recognize', () => {
+                this.close();
+            });
 
             this._buildUi();
         }
@@ -104,7 +118,7 @@ export const RclipPopup = GObject.registerClass(
             });
             this._listBox = new St.BoxLayout({
                 style_class: 'rclip-list',
-                vertical: true,
+                orientation: Clutter.Orientation.VERTICAL,
                 x_expand: true,
             });
             this._scrollView.set_child(this._listBox);
@@ -152,18 +166,23 @@ export const RclipPopup = GObject.registerClass(
             this.show();
 
             this._modalGrab = Main.pushModal(this, { actionMode: Shell.ActionMode.POPUP });
-            this._stageEventId = global.stage.connect('captured-event', (_actor, event) =>
-                this._onStageEvent(event)
+            this.add_action_full(
+                'rclip-key-capture',
+                Clutter.EventPhase.CAPTURE,
+                this._keyController
+            );
+            this.add_action_full(
+                'rclip-click-outside',
+                Clutter.EventPhase.CAPTURE,
+                this._clickOutsideGesture
             );
             this._searchEntry.grab_key_focus();
         }
 
         close() {
             if (!this.visible) return;
-            if (this._stageEventId) {
-                global.stage.disconnect(this._stageEventId);
-                this._stageEventId = 0;
-            }
+            this.remove_action(this._keyController);
+            this.remove_action(this._clickOutsideGesture);
             if (this._modalGrab) {
                 Main.popModal(this._modalGrab);
                 this._modalGrab = null;
@@ -171,25 +190,10 @@ export const RclipPopup = GObject.registerClass(
             this.hide();
         }
 
-        _onStageEvent(event) {
-            const type = event.type();
-            if (type === Clutter.EventType.BUTTON_PRESS) {
-                const [ex, ey] = event.get_coords();
-                const [px, py] = this.get_transformed_position();
-                const [pw, ph] = this.get_transformed_size();
-                if (ex < px || ex > px + pw || ey < py || ey > py + ph) {
-                    this.close();
-                    return Clutter.EVENT_STOP;
-                }
-                return Clutter.EVENT_PROPAGATE;
-            }
-
-            if (type !== Clutter.EventType.KEY_PRESS) {
-                return Clutter.EVENT_PROPAGATE;
-            }
-
-            const key = event.get_key_symbol();
-            const state = event.get_state();
+        _onKeyPress() {
+            const [, key] = this._keyController.get_key();
+            const [, pressed, latched, locked] = this._keyController.get_state();
+            const state = pressed | latched | locked;
             const ctrl = Boolean(state & Clutter.ModifierType.CONTROL_MASK);
 
             if (key === Clutter.KEY_Escape) {
@@ -204,7 +208,11 @@ export const RclipPopup = GObject.registerClass(
                 this._moveSelection(-1);
                 return Clutter.EVENT_STOP;
             }
-            if (key === Clutter.KEY_Return || key === Clutter.KEY_KP_Enter) {
+            if (
+                key === Clutter.KEY_Return ||
+                key === Clutter.KEY_KP_Enter ||
+                key === Clutter.KEY_ISO_Enter
+            ) {
                 this._activateSelected();
                 return Clutter.EVENT_STOP;
             }
@@ -310,7 +318,7 @@ export const RclipPopup = GObject.registerClass(
 
             const body = new St.BoxLayout({
                 style_class: 'rclip-card-body',
-                vertical: true,
+                orientation: Clutter.Orientation.VERTICAL,
                 x_expand: true,
             });
 
@@ -380,14 +388,18 @@ export const RclipPopup = GObject.registerClass(
             card.add_child(body);
             card.add_child(actions);
 
-            card.connect('button-press-event', (_actor, event) => {
-                if (event.get_button() === 1) {
-                    this._selectedIdx = index;
-                    this._onPasteItem(item);
-                    return Clutter.EVENT_STOP;
-                }
-                return Clutter.EVENT_PROPAGATE;
+            const cardClick = new Clutter.ClickGesture();
+            cardClick.connect('may-recognize', () => {
+                if (cardClick.get_button() !== 1) return false;
+                const event = cardClick.get_point_event(0);
+                const targetActor = event ? global.stage.get_event_actor(event) : null;
+                return !actions.contains(targetActor);
             });
+            cardClick.connect('recognize', () => {
+                this._selectedIdx = index;
+                this._onPasteItem(item);
+            });
+            card.add_action(cardClick);
 
             return card;
         }

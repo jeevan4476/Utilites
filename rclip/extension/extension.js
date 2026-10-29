@@ -34,7 +34,7 @@ export default class RclipExtension extends Extension {
         this._previousWindow = null;
         this._pasteTimeoutId = 0;
 
-        const seat = Clutter.get_default_backend().get_default_seat();
+        const seat = global.stage.context.get_backend().get_default_seat();
         this._virtualKeyboard = seat.create_virtual_device(
             Clutter.InputDeviceType.KEYBOARD_DEVICE
         );
