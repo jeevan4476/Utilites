@@ -1,0 +1,50 @@
+#!/usr/bin/env bash
+set -u
+
+APPBOX_BIN="${HOME}/.local/bin/appbox"
+if [[ ! -x "$APPBOX_BIN" ]]; then
+  APPBOX_BIN="$(command -v appbox || true)"
+fi
+
+if [[ -z "$APPBOX_BIN" ]]; then
+  zenity --error --title="AppBox" --text="Could not find 'appbox' in ~/.local/bin or PATH."
+  exit 1
+fi
+
+mapfile -t SELECTED < <(printf '%s\n' "${NAUTILUS_SCRIPT_SELECTED_FILE_PATHS:-}" | sed '/^$/d')
+if [[ ${#SELECTED[@]} -eq 0 ]]; then
+  zenity --error --title="AppBox" --text="Select one or more .AppImage or .rpm files first."
+  exit 1
+fi
+
+for file in "${SELECTED[@]}"; do
+  name="$(basename "$file")"
+  lower="${name,,}"
+  if [[ "$lower" != *.appimage && "$lower" != *.rpm ]]; then
+    zenity --warning --title="AppBox" --text="Skipping unsupported file: $name"
+    continue
+  fi
+
+  log_file="$(mktemp)"
+  (
+    echo "# Installing $name..."
+    "$APPBOX_BIN" install "$file" >"$log_file" 2>&1
+    rc=$?
+    echo "$rc" > "${log_file}.rc"
+  ) | zenity --progress --pulsate --auto-close --no-cancel --title="AppBox" --text="Installing $name..."
+
+  rc="$(cat "${log_file}.rc" 2>/dev/null || echo 1)"
+  output="$(cat "$log_file" 2>/dev/null || true)"
+  rm -f "$log_file" "${log_file}.rc"
+
+  if [[ "$rc" -ne 0 ]]; then
+    zenity --error --title="AppBox Install Failed" --text="Failed to install $name:\n\n$output"
+  else
+    if grep -qi "warning:" <<<"$output"; then
+      zenity --warning --title="AppBox Notice ($name)" --text="$output"
+    fi
+    if command -v notify-send >/dev/null 2>&1; then
+      notify-send "AppBox" "Installed $name to your application menu."
+    fi
+  fi
+done
