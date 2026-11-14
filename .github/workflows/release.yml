@@ -1,0 +1,167 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "rclip-v*"
+      - "appbox-v*"
+  workflow_dispatch:
+    inputs:
+      target:
+        description: Utility to package
+        required: true
+        type: choice
+        options:
+          - rclip
+          - appbox
+
+permissions:
+  contents: write
+
+jobs:
+  release-rclip:
+    name: Release rclip
+    if: >-
+      startsWith(github.ref, 'refs/tags/rclip-v') ||
+      (github.event_name == 'workflow_dispatch' && inputs.target == 'rclip')
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Validate tag matches Cargo.toml version
+        if: startsWith(github.ref, 'refs/tags/rclip-v')
+        run: |
+          tag_ver="${GITHUB_REF_NAME#rclip-v}"
+          crate_ver="$(python3 -c 'import tomllib; print(tomllib.load(open("rclip/Cargo.toml", "rb"))["package"]["version"])')"
+          if [[ "$tag_ver" != "$crate_ver" ]]; then
+            echo "Tag version ($tag_ver) does not match rclip/Cargo.toml ($crate_ver)" >&2
+            exit 1
+          fi
+
+      - name: Install GTK4 development libraries
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libgtk-4-dev pkg-config
+
+      - name: Setup Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache Cargo artifacts
+        uses: Swatinem/rust-cache@v2
+
+      - name: Run tests
+        run: cargo test --workspace
+
+      - name: Build release binary
+        run: cargo build --release -p rclip
+
+      - name: Package rclip release archive
+        run: |
+          mkdir -p dist stage/rclip
+          cp target/release/rclip stage/rclip/rclip
+          chmod +x stage/rclip/rclip
+          cp -r gnome-extension stage/rclip/
+          cp io.github.rclip.desktop io.github.rclip.service README.md stage/rclip/
+          cat > stage/rclip/install.sh <<'EOF'
+          #!/usr/bin/env bash
+          set -euo pipefail
+          SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+          INSTALL_BIN="${HOME}/.local/bin"
+          mkdir -p "$INSTALL_BIN" "${HOME}/.local/share/applications" "${HOME}/.local/share/dbus-1/services"
+          cp "$SCRIPT_DIR/rclip" "$INSTALL_BIN/rclip"
+          chmod +x "$INSTALL_BIN/rclip"
+          sed "s|Exec=.*|Exec=${INSTALL_BIN}/rclip daemon|" "$SCRIPT_DIR/io.github.rclip.service" > "${HOME}/.local/share/dbus-1/services/io.github.rclip.service"
+          cp "$SCRIPT_DIR/io.github.rclip.desktop" "${HOME}/.local/share/applications/io.github.rclip.desktop"
+          EXT_DIR="${HOME}/.local/share/gnome-shell/extensions/rclip-watcher@utilities.local"
+          mkdir -p "$EXT_DIR"
+          cp -r "$SCRIPT_DIR/gnome-extension/"* "$EXT_DIR/"
+          if command -v gsettings >/dev/null 2>&1; then
+            CUSTOM_KEY="/org/gnome/settings-daemon/plugins/media-keys/custom-keybindings/custom1/"
+            gsettings set "org.gnome.settings-daemon.plugins.media-keys.custom-keybinding:$CUSTOM_KEY" name 'rclip Clipboard'
+            gsettings set "org.gnome.settings-daemon.plugins.media-keys.custom-keybinding:$CUSTOM_KEY" command "${INSTALL_BIN}/rclip toggle"
+            gsettings set "org.gnome.settings-daemon.plugins.media-keys.custom-keybinding:$CUSTOM_KEY" binding '<Super>v'
+          fi
+          echo "Installed rclip to ${INSTALL_BIN}/rclip"
+          EOF
+          chmod +x stage/rclip/install.sh
+          tar -C stage -czf dist/rclip-linux-x86_64.tar.gz rclip
+          (cd dist && sha256sum rclip-linux-x86_64.tar.gz > SHA256SUMS.txt)
+
+      - name: Upload workflow artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: rclip-release
+          path: dist/*
+
+      - name: Publish GitHub Release
+        if: startsWith(github.ref, 'refs/tags/rclip-v')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: dist/*
+          generate_release_notes: true
+
+  release-appbox:
+    name: Release appbox
+    if: >-
+      startsWith(github.ref, 'refs/tags/appbox-v') ||
+      (github.event_name == 'workflow_dispatch' && inputs.target == 'appbox')
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Validate tag matches appbox version
+        if: startsWith(github.ref, 'refs/tags/appbox-v')
+        run: |
+          tag_ver="${GITHUB_REF_NAME#appbox-v}"
+          pkg_ver="$(PYTHONPATH=appbox python3 -c 'import appbox; print(appbox.__version__)')"
+          if [[ "$tag_ver" != "$pkg_ver" ]]; then
+            echo "Tag version ($tag_ver) does not match appbox.__version__ ($pkg_ver)" >&2
+            exit 1
+          fi
+
+      - name: Install runtime & lint tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y rpm cpio p7zip-full desktop-file-utils shellcheck
+
+      - name: Run tests & checks
+        env:
+          PYTHONPATH: appbox
+        run: |
+          python3 -m unittest discover -s appbox/tests -v
+          python3 -m compileall -q appbox/appbox appbox/tests
+          shellcheck appbox/install.sh "appbox/nautilus/Install as App"
+
+      - name: Package appbox artifacts
+        run: |
+          mkdir -p dist stage_zip stage_tar/appbox
+          cp -r appbox/appbox stage_zip/appbox
+          find stage_zip -name "__pycache__" -type d -exec rm -rf {} +
+          python3 -m zipapp stage_zip -m "appbox.cli:main" -o dist/appbox.pyz -p "/usr/bin/env python3"
+          chmod +x dist/appbox.pyz
+
+          cp -r appbox/appbox appbox/nautilus appbox/install.sh appbox/README.md stage_tar/appbox/
+          find stage_tar -name "__pycache__" -type d -exec rm -rf {} +
+          tar -C stage_tar -czf dist/appbox-linux-noarch.tar.gz appbox
+
+          (cd dist && sha256sum appbox.pyz appbox-linux-noarch.tar.gz > SHA256SUMS.txt)
+
+      - name: Upload workflow artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: appbox-release
+          path: dist/*
+
+      - name: Publish GitHub Release
+        if: startsWith(github.ref, 'refs/tags/appbox-v')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: dist/*
+          generate_release_notes: true

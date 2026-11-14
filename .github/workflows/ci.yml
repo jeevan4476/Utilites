@@ -1,0 +1,82 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  rclip:
+    name: rclip (Rust / GTK4)
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install GTK4 development libraries
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libgtk-4-dev pkg-config
+
+      - name: Setup Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+
+      - name: Cache Cargo artifacts
+        uses: Swatinem/rust-cache@v2
+
+      - name: Run clippy
+        run: cargo clippy --all-targets
+
+      - name: Run unit tests
+        run: cargo test --workspace
+
+      - name: Build release binary
+        run: cargo build --release -p rclip
+
+  appbox:
+    name: appbox (Python)
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install runtime & lint tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y rpm cpio p7zip-full desktop-file-utils shellcheck
+
+      - name: Run unit tests
+        env:
+          PYTHONPATH: appbox
+        run: python3 -m unittest discover -s appbox/tests -v
+
+      - name: Bytecode syntax check
+        run: python3 -m compileall -q appbox/appbox appbox/tests
+
+      - name: Lint shell scripts
+        run: shellcheck appbox/install.sh "appbox/nautilus/Install as App"
+
+      - name: Smoke-test zipapp packaging
+        run: |
+          stage="$(mktemp -d)"
+          cp -r appbox/appbox "$stage/appbox"
+          find "$stage" -name "__pycache__" -type d -exec rm -rf {} +
+          python3 -m zipapp "$stage" -m "appbox.cli:main" -o /tmp/appbox.pyz -p "/usr/bin/env python3"
+          chmod +x /tmp/appbox.pyz
+          /tmp/appbox.pyz --version
+          rm -rf "$stage" /tmp/appbox.pyz

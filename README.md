@@ -60,3 +60,17 @@ This builds the release binary, installs it to `~/.local/bin/rclip`, installs th
 `appbox` converts downloaded `.AppImage` and `.rpm` packages into integrated user-space desktop apps (`.desktop` launcher, `hicolor` icons, `~/.local/bin/` CLI wrapper, and clean uninstall) without `sudo`, via CLI or GNOME Files right-click (**Scripts → Install as App**).
 
 See [appbox/README.md](appbox/README.md) for usage and installation (`./appbox/install.sh`).
+
+---
+
+## CI/CD & Releases
+
+- **CI (`.github/workflows/ci.yml`):** Runs on pushes and pull requests to `main` — builds & tests `rclip` (`cargo clippy`, `cargo test`, `cargo build --release`) and tests/lints `appbox` (`unittest`, `compileall`, `shellcheck`, `zipapp`).
+- **Releases (`.github/workflows/release.yml`):** Triggered by per-utility SemVer tags or manual `workflow_dispatch`:
+  ```bash
+  # Release rclip (must match rclip/Cargo.toml version)
+  git tag rclip-v0.1.0 && git push origin rclip-v0.1.0
+
+  # Release appbox (must match appbox/appbox/__init__.py __version__)
+  git tag appbox-v0.1.0 && git push origin appbox-v0.1.0
+  ```
