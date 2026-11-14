@@ -1,0 +1,147 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "rclip-v*"
+      - "appbox-v*"
+  workflow_dispatch:
+    inputs:
+      target:
+        description: Utility to package
+        required: true
+        type: choice
+        options:
+          - rclip
+          - appbox
+
+permissions:
+  contents: write
+
+jobs:
+  release-rclip:
+    name: Release rclip
+    if: >-
+      startsWith(github.ref, 'refs/tags/rclip-v') ||
+      (github.event_name == 'workflow_dispatch' && inputs.target == 'rclip')
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Validate tag matches rclip version
+        if: startsWith(github.ref, 'refs/tags/rclip-v')
+        run: |
+          tag_ver="${GITHUB_REF_NAME#rclip-v}"
+          pkg_ver="$(PYTHONPATH=rclip python3 -c 'import rclip_cli; print(rclip_cli.__version__)')"
+          if [[ "$tag_ver" != "$pkg_ver" ]]; then
+            echo "Tag version ($tag_ver) does not match rclip_cli.__version__ ($pkg_ver)" >&2
+            exit 1
+          fi
+
+      - name: Install GJS, GLib schema tools & shellcheck
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y gjs libglib2.0-bin shellcheck
+
+      - name: Run tests & checks
+        working-directory: rclip
+        env:
+          PYTHONPATH: .
+        run: |
+          gjs -m tests/test_store.mjs
+          python3 -m unittest discover -s tests -v
+          glib-compile-schemas --dry-run extension/schemas
+          shellcheck install.sh
+
+      - name: Package rclip release archive
+        run: |
+          mkdir -p dist stage/rclip
+          cp -r rclip/extension rclip/rclip_cli rclip/install.sh rclip/README.md stage/rclip/
+          find stage -name "__pycache__" -type d -exec rm -rf {} +
+          glib-compile-schemas stage/rclip/extension/schemas
+          tar -C stage -czf dist/rclip-linux-noarch.tar.gz rclip
+          (cd dist && sha256sum rclip-linux-noarch.tar.gz > SHA256SUMS.txt)
+
+      - name: Upload workflow artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: rclip-release
+          path: dist/*
+
+      - name: Publish GitHub Release
+        if: startsWith(github.ref, 'refs/tags/rclip-v')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: dist/*
+          generate_release_notes: true
+
+  release-appbox:
+    name: Release appbox
+    if: >-
+      startsWith(github.ref, 'refs/tags/appbox-v') ||
+      (github.event_name == 'workflow_dispatch' && inputs.target == 'appbox')
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Validate tag matches appbox version
+        if: startsWith(github.ref, 'refs/tags/appbox-v')
+        run: |
+          tag_ver="${GITHUB_REF_NAME#appbox-v}"
+          pkg_ver="$(PYTHONPATH=appbox python3 -c 'import appbox; print(appbox.__version__)')"
+          if [[ "$tag_ver" != "$pkg_ver" ]]; then
+            echo "Tag version ($tag_ver) does not match appbox.__version__ ($pkg_ver)" >&2
+            exit 1
+          fi
+
+      - name: Install runtime & lint tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y rpm cpio p7zip-full desktop-file-utils shellcheck
+
+      - name: Run tests & checks
+        env:
+          PYTHONPATH: appbox
+        run: |
+          python3 -m unittest discover -s appbox/tests -v
+          python3 -m compileall -q appbox/appbox appbox/tests
+          shellcheck appbox/install.sh "appbox/nautilus/Install as App"
+
+      - name: Package appbox artifacts
+        run: |
+          mkdir -p dist stage_zip stage_tar/appbox
+          cp -r appbox/appbox stage_zip/appbox
+          find stage_zip -name "__pycache__" -type d -exec rm -rf {} +
+          python3 -m zipapp stage_zip -m "appbox.cli:main" -o dist/appbox.pyz -p "/usr/bin/env python3"
+          chmod +x dist/appbox.pyz
+
+          cp -r appbox/appbox appbox/nautilus appbox/install.sh appbox/README.md stage_tar/appbox/
+          find stage_tar -name "__pycache__" -type d -exec rm -rf {} +
+          tar -C stage_tar -czf dist/appbox-linux-noarch.tar.gz appbox
+
+          (cd dist && sha256sum appbox.pyz appbox-linux-noarch.tar.gz > SHA256SUMS.txt)
+
+      - name: Upload workflow artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: appbox-release
+          path: dist/*
+
+      - name: Publish GitHub Release
+        if: startsWith(github.ref, 'refs/tags/appbox-v')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: dist/*
+          generate_release_notes: true

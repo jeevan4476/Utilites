@@ -1,0 +1,86 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  rclip:
+    name: rclip (GNOME Shell + Python)
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install GJS, GLib schema tools & shellcheck
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y gjs libglib2.0-bin shellcheck
+
+      - name: Run GJS store tests
+        working-directory: rclip
+        run: gjs -m tests/test_store.mjs
+
+      - name: Run Python CLI tests
+        working-directory: rclip
+        env:
+          PYTHONPATH: .
+        run: python3 -m unittest discover -s tests -v
+
+      - name: Compile GSettings schema (dry-run)
+        run: glib-compile-schemas --dry-run rclip/extension/schemas
+
+      - name: Lint shell script
+        run: shellcheck rclip/install.sh
+
+  appbox:
+    name: appbox (Python)
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install runtime & lint tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y rpm cpio p7zip-full desktop-file-utils shellcheck
+
+      - name: Run unit tests
+        env:
+          PYTHONPATH: appbox
+        run: python3 -m unittest discover -s appbox/tests -v
+
+      - name: Bytecode syntax check
+        run: python3 -m compileall -q appbox/appbox appbox/tests
+
+      - name: Lint shell scripts
+        run: shellcheck appbox/install.sh "appbox/nautilus/Install as App"
+
+      - name: Smoke-test zipapp packaging
+        run: |
+          stage="$(mktemp -d)"
+          cp -r appbox/appbox "$stage/appbox"
+          find "$stage" -name "__pycache__" -type d -exec rm -rf {} +
+          python3 -m zipapp "$stage" -m "appbox.cli:main" -o /tmp/appbox.pyz -p "/usr/bin/env python3"
+          chmod +x /tmp/appbox.pyz
+          /tmp/appbox.pyz --version
+          rm -rf "$stage" /tmp/appbox.pyz
