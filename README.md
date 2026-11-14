@@ -52,3 +52,11 @@ rclip add-clip "text" # Add text directly to history
 ./install.sh
 ```
 This builds the release binary, installs it to `~/.local/bin/rclip`, installs the D-Bus service, copies the GNOME extension, and binds <kbd>Super</kbd>+<kbd>V</kbd>.
+
+---
+
+## appbox — User-Space AppImage & RPM Desktop Integrator
+
+`appbox` converts downloaded `.AppImage` and `.rpm` packages into integrated user-space desktop apps (`.desktop` launcher, `hicolor` icons, `~/.local/bin/` CLI wrapper, and clean uninstall) without `sudo`, via CLI or GNOME Files right-click (**Scripts → Install as App**).
+
+See [appbox/README.md](appbox/README.md) for usage and installation (`./appbox/install.sh`).
