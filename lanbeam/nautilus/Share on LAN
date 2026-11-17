@@ -1,0 +1,39 @@
+#!/bin/bash
+# nautilus/Share on LAN
+# GNOME Files (Nautilus) right-click script: shares the selected file(s) or
+# folder over the LAN using `lanbeam send`.
+#
+# Install to: ~/.local/share/nautilus/scripts/Share on LAN
+# Make executable: chmod +x ~/.local/share/nautilus/scripts/"Share on LAN"
+
+set -euo pipefail
+
+LANBEAM="${LANBEAM:-$HOME/.local/bin/lanbeam}"
+
+if ! command -v "$LANBEAM" >/dev/null 2>&1; then
+    zenity --error --text="lanbeam binary not found at $LANBEAM\nRun install.sh first." 2>/dev/null || \
+    notify-send "lanbeam" "Binary not found: $LANBEAM" 2>/dev/null || true
+    exit 1
+fi
+
+# Nautilus passes selected file paths via $NAUTILUS_SCRIPT_SELECTED_FILE_PATHS
+# (one per line) or as positional arguments.
+files=()
+if [ -n "${NAUTILUS_SCRIPT_SELECTED_FILE_PATHS:-}" ]; then
+    while IFS= read -r line; do
+        [ -n "$line" ] && files+=("$line")
+    done <<< "$NAUTILUS_SCRIPT_SELECTED_FILE_PATHS"
+else
+    files=("$@")
+fi
+
+if [ ${#files[@]} -eq 0 ]; then
+    zenity --error --text="No files selected." 2>/dev/null || true
+    exit 1
+fi
+
+# Launch lanbeam send detached, showing a notification.
+setsid "$LANBEAM" send "${files[@]}" --gui \
+    >/tmp/lanbeam-gui.log 2>&1 < /dev/null &
+disown
+notify-send "lanbeam" "Sharing ${#files[@]} item(s) over LAN" 2>/dev/null || true

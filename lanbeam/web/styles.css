@@ -1,0 +1,440 @@
+/* lanbeam mobile web frontend styles.
+ *
+ * Responsive dark/light theme built on CSS custom properties. Designed for
+ * phone browsers (narrow portrait) but usable on desktop too.
+ */
+
+:root {
+  --color-bg: #f5f5f7;
+  --color-surface: #ffffff;
+  --color-surface-elev: #f2f2f2;
+  --color-text: #1c1c1e;
+  --color-text-muted: #6e6e73;
+  --color-border: #d2d2d7;
+  --color-accent: #0a84ff;
+  --color-accent-hover: #0060cc;
+  --color-danger: #ff3b30;
+  --color-success: #34c759;
+  --color-chip-bg: #e5e5ea;
+  --color-shadow: rgba(0, 0, 0, 0.08);
+}
+
+[data-theme="dark"] {
+  --color-bg: #000000;
+  --color-surface: #1c1c1e;
+  --color-surface-elev: #2c2c2e;
+  --color-text: #f2f2f7;
+  --color-text-muted: #8e8e93;
+  --color-border: #3a3a3c;
+  --color-accent: #0a84ff;
+  --color-accent-hover: #3a9bff;
+  --color-danger: #ff453a;
+  --color-success: #30d158;
+  --color-chip-bg: #3a3a3c;
+  --color-shadow: rgba(0, 0, 0, 0.4);
+}
+
+* {
+  box-sizing: border-box;
+  margin: 0;
+  padding: 0;
+}
+
+html,
+body {
+  height: 100%;
+  background: var(--color-bg);
+  color: var(--color-text);
+  font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica,
+    Arial, sans-serif;
+  font-size: 16px;
+  line-height: 1.4;
+  -webkit-tap-highlight-color: transparent;
+}
+
+body {
+  display: flex;
+  flex-direction: column;
+}
+
+.hidden {
+  display: none !important;
+}
+
+.show {
+  display: block;
+}
+
+/* ---------- Header ---------- */
+
+header {
+  background: var(--color-surface);
+  border-bottom: 1px solid var(--color-border);
+  padding: 12px 16px;
+  flex: 0 0 auto;
+}
+
+.app-title {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-weight: 600;
+  font-size: 1.125rem;
+}
+
+.token-chip {
+  margin-left: auto;
+  background: var(--color-chip-bg);
+  color: var(--color-text);
+  border: 1px solid var(--color-border);
+  border-radius: 6px;
+  padding: 4px 10px;
+  font-size: 0.8125rem;
+  font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas,
+    monospace;
+  word-break: break-all;
+}
+
+/* ---------- Main ---------- */
+
+main {
+  flex: 1 1 auto;
+  overflow-y: auto;
+  padding: 16px;
+}
+
+section {
+  margin-bottom: 16px;
+}
+
+h2 {
+  font-size: 0.875rem;
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+  color: var(--color-text-muted);
+  margin-bottom: 10px;
+}
+
+/* ---------- Session status card ---------- */
+
+.session-card {
+  background: var(--color-surface);
+  border: 1px solid var(--color-border);
+  border-radius: 12px;
+  padding: 16px;
+  box-shadow: 0 4px 12px var(--color-shadow);
+}
+
+.session-row {
+  display: flex;
+  justify-content: space-between;
+  align-items: baseline;
+  gap: 8px;
+  font-size: 0.9375rem;
+  margin-bottom: 6px;
+}
+
+.session-row .label {
+  color: var(--color-text-muted);
+}
+
+.session-row .value {
+  font-weight: 600;
+  font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+}
+
+.session-actions {
+  display: flex;
+  gap: 8px;
+  margin-top: 14px;
+}
+
+/* ---------- Shared text banner ---------- */
+
+.shared-text {
+  background: var(--color-surface-elev);
+  border: 1px solid var(--color-border);
+  border-radius: 10px;
+  padding: 12px 14px;
+  font-size: 0.9375rem;
+  word-break: break-all;
+  margin-bottom: 16px;
+}
+
+.shared-text .label {
+  display: block;
+  font-size: 0.75rem;
+  color: var(--color-text-muted);
+  margin-bottom: 4px;
+}
+
+.shared-text .copy-btn {
+  float: right;
+  font-size: 0.75rem;
+  padding: 2px 8px;
+  margin-top: -2px;
+}
+
+/* ---------- Buttons ---------- */
+
+.btn {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  border: 1px solid var(--color-border);
+  border-radius: 8px;
+  padding: 8px 14px;
+  font-size: 0.9375rem;
+  font-weight: 500;
+  color: var(--color-text);
+  background: var(--color-surface-elev);
+  cursor: pointer;
+  transition: background 0.15s, border-color 0.15s;
+}
+
+.btn:hover {
+  background: var(--color-surface);
+}
+
+.btn:active {
+  transform: scale(0.98);
+}
+
+.btn-primary {
+  background: var(--color-accent);
+  border-color: var(--color-accent);
+  color: #ffffff;
+}
+
+.btn-primary:hover {
+  background: var(--color-accent-hover);
+  border-color: var(--color-accent-hover);
+}
+
+.btn-outline {
+  background: transparent;
+  color: var(--color-accent);
+}
+
+.btn-outline:hover {
+  background: var(--color-surface-elev);
+}
+
+.btn-sm {
+  padding: 6px 10px;
+  font-size: 0.8125rem;
+}
+
+.btn-group {
+  display: flex;
+  gap: 6px;
+}
+
+/* ---------- File list ---------- */
+
+.file-list,
+.upload-list {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.empty {
+  color: var(--color-text-muted);
+  font-size: 0.9375rem;
+  padding: 8px 0;
+}
+
+.file-row,
+.upload-row {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  background: var(--color-surface);
+  border: 1px solid var(--color-border);
+  border-radius: 10px;
+  padding: 10px 12px;
+}
+
+.file-row.status-error,
+.upload-row.status-error {
+  border-color: var(--color-danger);
+}
+
+.file-name,
+.upload-name {
+  flex: 1 1 1;
+  min-width: 0;
+  font-size: 0.9375rem;
+  word-break: break-all;
+}
+
+.file-size,
+.upload-size {
+  font-size: 0.8125rem;
+  color: var(--color-text-muted);
+  font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas,
+    monospace;
+  white-space: nowrap;
+}
+
+.file-progress,
+.upload-progress {
+  flex: 0 0 auto;
+  width: 70px;
+}
+
+.progress-bar {
+  width: 100%;
+  height: 6px;
+  background: var(--color-chip-bg);
+  border-radius: 3px;
+  overflow: hidden;
+}
+
+.progress-fill {
+  height: 100%;
+  background: var(--color-accent);
+  width: 0%;
+  transition: width 0.2s;
+}
+
+.file-actions {
+  flex: 0 0 auto;
+  display: flex;
+  gap: 6px;
+}
+
+/* ---------- Drop zone ---------- */
+
+.drop-zone {
+  border: 2px dashed var(--color-border);
+  border-radius: 12px;
+  padding: 24px 16px;
+  text-align: center;
+  color: var(--color-text-muted);
+  background: var(--color-surface);
+  margin-bottom: 12px;
+}
+
+.drop-zone p {
+  font-size: 0.9375rem;
+  margin-bottom: 4px;
+}
+
+.drop-zone small {
+  font-size: 0.75rem;
+  color: var(--color-text-muted);
+}
+
+/* ---------- Text share form ---------- */
+
+.text-share {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+
+.text-share input[type="text"],
+.text-share textarea {
+  width: 100%;
+  background: var(--color-surface);
+  border: 1px solid var(--color-border);
+  border-radius: 10px;
+  padding: 10px 14px;
+  color: var(--color-text);
+  font-size: 0.9375rem;
+  font-family: inherit;
+}
+
+.text-share input[type="text"]::placeholder,
+.text-share textarea::placeholder {
+  color: var(--color-text-muted);
+}
+
+.text-share input[type="text"]:focus,
+.text-share textarea:focus {
+  outline: 2px solid var(--color-accent);
+  border-color: transparent;
+}
+
+/* ---------- File input ---------- */
+
+.file-input-label {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 12px 16px;
+  background: var(--color-surface);
+  border: 1px solid var(--color-border);
+  border-radius: 10px;
+  cursor: pointer;
+}
+
+.file-input-label:hover {
+  background: var(--color-surface-elev);
+}
+
+input[type="file"] {
+  display: none;
+}
+
+/* ---------- Toast ---------- */
+
+.toast {
+  position: fixed;
+  top: 16px;
+  left: 50%;
+  transform: translateX(-50%);
+  background: rgba(0, 0, 0, 0.8);
+  color: #ffffff;
+  padding: 8px 14px;
+  border-radius: 8px;
+  font-size: 0.875rem;
+  z-index: 1000;
+  opacity: 0;
+  transition: opacity 0.2s;
+  pointer-events: none;
+}
+
+.toast.hidden {
+  opacity: 0;
+}
+
+.toast.show {
+  opacity: 1;
+}
+
+/* ---------- Footer ---------- */
+
+footer {
+  background: var(--color-surface);
+  border-top: 1px solid var(--color-border);
+  padding: 12px 16px;
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  flex: 0 0 auto;
+}
+
+.theme-toggle {
+  background: none;
+  border: none;
+  color: var(--color-accent);
+  font-size: 0.875rem;
+  cursor: pointer;
+  padding: 4px 8px;
+}
+
+.theme-toggle:hover {
+  text-decoration: underline;
+}
+
+/* ---------- Responsive ---------- */
+
+@media (min-width: 640px) {
+  main {
+    max-width: 520px;
+    margin: 0 auto;
+  }
+}

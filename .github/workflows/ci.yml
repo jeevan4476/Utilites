@@ -84,3 +84,41 @@ jobs:
           chmod +x /tmp/appbox.pyz
           /tmp/appbox.pyz --version
           rm -rf "$stage" /tmp/appbox.pyz
+
+  lanbeam:
+    name: lanbeam (Rust + TypeScript + Python)
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Install bun
+        uses: oven-sh/setup-bun@v2
+
+      - name: Install system deps
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libgtk-4-dev shellcheck python3-gi gir1.2-gtk-4.0
+
+      - name: Run TypeScript tests + bundle frontend
+        working-directory: lanbeam/web
+        run: |
+          bun install
+          bun test
+          bun run build.ts
+
+      - name: Run Rust tests
+        run: cargo test --manifest-path lanbeam/Cargo.toml --verbose
+
+      - name: Run Python popup tests + syntax check
+        env:
+          PYTHONPATH: lanbeam
+        run: |
+          python3 -m unittest discover -s lanbeam/tests -v
+          python3 -m compileall -q lanbeam/ui lanbeam/tests
+
+      - name: Lint shell scripts
+        run: shellcheck lanbeam/install.sh "lanbeam/nautilus/Share on LAN"

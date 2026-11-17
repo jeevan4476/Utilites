@@ -1,0 +1,13 @@
+{
+  "name": "lanbeam-web",
+  "version": "0.1.0",
+  "description": "Mobile web frontend for lanbeam - local Wi-Fi file transfer",
+  "private": true,
+  "scripts": {
+    "test": "bun test",
+    "build": "bun run build.ts"
+  },
+  "devDependencies": {
+    "typescript": "^5.0.0"
+  }
+}

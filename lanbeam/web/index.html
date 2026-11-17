@@ -1,0 +1,126 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>lanbeam</title>
+    <link rel="stylesheet" href="styles.css" />
+  </head>
+  <body>
+    <header>
+      <div class="app-title">
+        <span>📡</span> lanbeam
+      </div>
+      <div class="token-chip" id="session-token">–</div>
+    </header>
+
+    <main>
+      <!-- Session status -->
+      <section>
+        <div class="session-card">
+          <div class="session-row">
+            <span class="label">Session URL</span>
+            <span class="value" id="session-url">–</span>
+          </div>
+          <div class="session-row">
+            <span class="label">Mode</span>
+            <span class="value" id="session-mode">–</span>
+          </div>
+          <div class="session-row">
+            <span class="label">Status</span>
+            <span class="value" id="session-active">–</span>
+          </div>
+          <div class="session-row">
+            <span class="label">Transfers</span>
+            <span class="value" id="session-counters">–</span>
+          </div>
+          <div class="session-row">
+            <span class="label">Time left</span>
+            <span class="value" id="session-time">–</span>
+          </div>
+          <div class="session-actions">
+            <button class="btn btn-primary btn-sm" data-action="copy-link">
+              Copy link
+            </button>
+            <button class="btn btn-primary btn-sm" data-action="download-all">
+              Download all (.zip)
+            </button>
+          </div>
+        </div>
+      </section>
+
+      <!-- Shared text banner -->
+      <div class="shared-text hidden" id="shared-text">
+        <span class="label">Shared text</span>
+        <span id="shared-text-body"></span>
+        <button class="copy-btn" data-action="copy-link">Copy</button>
+      </div>
+
+      <!-- Files to download -->
+      <section>
+        <h2>Files</h2>
+        <div class="file-list" id="file-list"></div>
+      </section>
+
+      <!-- Upload queue -->
+      <section>
+        <h2>Upload from phone</h2>
+        <div class="drop-zone" data-drop-zone>
+          <p>Drop photos or videos here</p>
+          <small>or tap to choose files</small>
+        </div>
+        <label class="file-input-label">
+          <span>Choose files</span>
+          <input type="file" id="file-input" multiple />
+        </label>
+        <div class="upload-list" id="upload-list"></div>
+      </section>
+
+      <!-- Text sharing -->
+      <section>
+        <h2>Share text / link</h2>
+        <form id="text-share-form" class="text-share">
+          <input
+            type="text"
+            id="text-share-input"
+            placeholder="Type a message or URL…"
+          />
+          <button class="btn btn-primary" type="submit">Send</button>
+        </form>
+      </section>
+
+      <div class="toast hidden" id="toast"></div>
+    </main>
+
+    <footer>
+      <button class="theme-toggle" data-action="theme">
+        🌓 Theme
+      </button>
+      <button class="btn btn-danger btn-sm" data-action="stop">
+        Stop sharing
+      </button>
+    </footer>
+
+    <script type="module">
+      import { LanbeamUI } from "./app.ts";
+
+      const token = document.getElementById("session-token");
+      const baseUrl = window.location.origin;
+
+      // The token is injected by the Rust backend into the page; fall back to
+      // reading it from the current URL path if embedded JSON is absent.
+      let sessionToken = "";
+      try {
+        const meta = document.getElementById("session-token");
+        // Token will be filled in by the backend at serve time.
+        sessionToken = meta ? (meta.textContent || "").trim() : "";
+      } catch {
+        sessionToken = "";
+      }
+
+      const ui = new LanbeamUI(sessionToken || "demo", baseUrl);
+      ui.wire(document.body);
+      ui.start();
+    </script>
+  </body>
+</html>
