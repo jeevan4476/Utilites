@@ -26,9 +26,9 @@ fn run(cmd: Command) -> Result<(), String> {
         Command::Send {
             paths,
             port,
-            timeout: _,
-            once: _,
-            max_downloads: _,
+            timeout,
+            once,
+            max_downloads,
             gui: _,
             json,
         } => {
@@ -37,6 +37,7 @@ fn run(cmd: Command) -> Result<(), String> {
             let (listener, bound_port) = network::bind_listener(ip, preferred)
                 .map_err(|e| format!("failed to bind port: {e}"))?;
             let token = network::generate_token();
+            let url = format!("http://{}:{}/{}", ip, bound_port, token);
 
             if json {
                 println!(
@@ -45,44 +46,71 @@ fn run(cmd: Command) -> Result<(), String> {
                 );
             } else {
                 println!("lanbeam send — sharing {} path(s)", paths.len());
-                println!("  URL:  http://{}:{}/{}", ip, bound_port, token);
+                println!("  URL:  {url}");
                 println!("  QR:");
-                let q = qr::QrCode::encode(&format!("http://{}:{}/{}", ip, bound_port, token))
+                let q = qr::QrCode::encode(&url)
                     .map_err(|e| format!("qr encode failed: {e}"))?;
                 println!("{}", q.to_ansi());
             }
 
             let session = server::ServerSession::new(listener, bound_port, &token)
-                .map_err(|e| format!("failed to start server: {e}"))?;
+                .map_err(|e| format!("failed to start server: {e}"))?
+                .with_mode("send")
+                .with_url(&url)
+                .with_share_paths(paths)
+                .with_once(once)
+                .with_max_downloads(max_downloads)
+                .with_timeout(timeout);
             println!("  Listening on port {bound_port}. Press Ctrl+C to stop.");
             session.run().map_err(|e| format!("server error: {e}"))?;
             Ok(())
         }
-        Command::Receive { dest: _, port, timeout: _, max_uploads: _, gui: _, json } => {
+        Command::Receive {
+            dest,
+            port,
+            timeout,
+            max_uploads,
+            gui: _,
+            json,
+        } => {
             let ip = network::detect_lan_ip();
             let preferred = port.unwrap_or(5001);
             let (listener, bound_port) = network::bind_listener(ip, preferred)
                 .map_err(|e| format!("failed to bind port: {e}"))?;
             let token = network::generate_token();
+            let url = format!("http://{}:{}/{}", ip, bound_port, token);
             if json {
                 println!("{{\"token\":\"{}\",\"ip\":\"{}\",\"port\":{}}}", token, ip, bound_port);
             } else {
-                println!("lanbeam receive — listening on http://{}:{}/{}", ip, bound_port, token);
+                println!("lanbeam receive — listening on {url}");
             }
-            let session = server::ServerSession::new(listener, bound_port, &token)
-                .map_err(|e| format!("failed to start server: {e}"))?;
+            let mut session = server::ServerSession::new(listener, bound_port, &token)
+                .map_err(|e| format!("failed to start server: {e}"))?
+                .with_mode("receive")
+                .with_url(&url)
+                .with_max_uploads(max_uploads)
+                .with_timeout(timeout);
+            if let Some(d) = dest {
+                session = session.with_dest(d);
+            }
             session.run().map_err(|e| format!("server error: {e}"))?;
             Ok(())
         }
-        Command::Text { text: _, from_clipboard: _, port, timeout: _, once: _, gui: _ } => {
+        Command::Text { text, from_clipboard: _, port, timeout, once, gui: _ } => {
             let ip = network::detect_lan_ip();
             let preferred = port.unwrap_or(5002);
             let (listener, bound_port) = network::bind_listener(ip, preferred)
                 .map_err(|e| format!("failed to bind port: {e}"))?;
             let token = network::generate_token();
-            println!("lanbeam text — http://{}:{}/{}", ip, bound_port, token);
+            let url = format!("http://{}:{}/{}", ip, bound_port, token);
+            println!("lanbeam text — {url}");
             let session = server::ServerSession::new(listener, bound_port, &token)
-                .map_err(|e| format!("failed to start server: {e}"))?;
+                .map_err(|e| format!("failed to start server: {e}"))?
+                .with_mode("text")
+                .with_url(&url)
+                .with_shared_text(text)
+                .with_once(once)
+                .with_timeout(timeout);
             session.run().map_err(|e| format!("server error: {e}"))?;
             Ok(())
         }
@@ -98,6 +126,14 @@ fn run(cmd: Command) -> Result<(), String> {
         }
         Command::SetupNautilus => {
             println!("setup-naatuilus (run install.sh to register the Nautilus script)");
+            Ok(())
+        }
+        Command::Version => {
+            println!("lanbeam {VERSION}");
+            Ok(())
+        }
+        Command::Help => {
+            println!("{}", lanbeam::cli::USAGE);
             Ok(())
         }
     }

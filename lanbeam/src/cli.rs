@@ -1,7 +1,5 @@
 use std::path::PathBuf;
 
-use crate::VERSION;
-
 /// Top-level CLI commands for lanbeam.
 #[derive(Debug, Clone)]
 pub enum Command {
@@ -35,6 +33,8 @@ pub enum Command {
         svg: bool,
     },
     SetupNautilus,
+    Version,
+    Help,
 }
 
 /// Minimal hand-rolled CLI parser (no external deps).
@@ -61,8 +61,8 @@ impl Parser {
             "text" => self.parse_text(),
             "qr" => self.parse_qr(),
             "setup-nautilus" => Ok(Command::SetupNautilus),
-            "--version" | "-V" => Err(format!("lanbeam {}", VERSION)),
-            "--help" | "-h" => Err(USAGE.to_string()),
+            "--version" | "-V" => Ok(Command::Version),
+            "--help" | "-h" => Ok(Command::Help),
             other => Err(format!("unknown subcommand: {other}")),
         }
     }
@@ -239,7 +239,7 @@ impl Parser {
     }
 }
 
-const USAGE: &str = r#"lanbeam 0.1.0 - local Wi-Fi file transfer
+pub const USAGE: &str = r#"lanbeam 0.1.0 - local Wi-Fi file transfer
 
 USAGE:
     lanbeam send <path...> [--port PORT] [--timeout SEC] [--once] [--max-downloads N] [--gui] [--json]
@@ -430,5 +430,13 @@ mod tests {
     fn port_requires_value() {
         let err = parse(&["lanbeam", "send", "/a.txt", "--port"]).unwrap_err();
         assert!(err.contains("requires a port value"));
+    }
+
+    #[test]
+    fn version_and_help_parse_as_success_commands() {
+        assert!(matches!(parse(&["lanbeam", "--version"]).unwrap(), Command::Version));
+        assert!(matches!(parse(&["lanbeam", "-V"]).unwrap(), Command::Version));
+        assert!(matches!(parse(&["lanbeam", "--help"]).unwrap(), Command::Help));
+        assert!(matches!(parse(&["lanbeam", "-h"]).unwrap(), Command::Help));
     }
 }
