@@ -117,9 +117,11 @@ impl ServerSession {
                     }
                 }
             } else {
-                if let Some(name) = p.file_name().and_then(|n| n.to_str()) {
-                    file_names.push(name.to_string());
-                }
+                let name = p
+                    .file_name()
+                    .map(|n| n.to_string_lossy().into_owned())
+                    .unwrap_or_else(|| "file".to_string());
+                file_names.push(name);
                 expanded_paths.push(p.clone());
             }
         }
@@ -1611,10 +1613,24 @@ fn serve_upload(
             b"Internal Server Error: Rename failed",
         );
     }
+    record_completed_upload(stream, state, final_name, final_path)
+}
+
+/// Record a completed upload in session state and send the JSON response.
+fn record_completed_upload(
+    stream: &mut TcpStream,
+    state: &Arc<Mutex<SessionState>>,
+    final_name: String,
+    final_path: PathBuf,
+) -> io::Result<()> {
     {
         let mut st = lock_state(state);
         st.uploads_received += 1;
         st.files.push(final_name.clone());
+        st.shared_paths.push(final_path.clone());
+        if !st.zip_roots.is_empty() {
+            st.zip_roots.push(final_path);
+        }
         if st
             .max_uploads
             .map_or(false, |max| st.uploads_received >= max)
@@ -1745,28 +1761,7 @@ fn serve_upload_chunked(
                     b"Internal Server Error: Rename failed",
                 );
             }
-            {
-                let mut st = lock_state(state);
-                st.uploads_received += 1;
-                st.files.push(final_name.clone());
-                if st
-                    .max_uploads
-                    .map_or(false, |max| st.uploads_received >= max)
-                {
-                    st.active = false;
-                }
-            }
-            #[cfg(not(test))]
-            {
-                let _ = std::process::Command::new("notify-send")
-                    .args(["lanbeam", &format!("Received: {}", final_name)])
-                    .status();
-            }
-            let body = format!(
-                "{{\"ok\":true,\"filename\":\"{}\"}}",
-                escape_json(&final_name)
-            );
-            respond(stream, 200, "application/json", body.as_bytes())
+            record_completed_upload(stream, state, final_name, final_path)
         }
         Err((status, message)) => {
             fail_cleanup(file);
@@ -3583,6 +3578,85 @@ mod tests {
         assert_eq!(total, payload.len() as u64);
         assert_eq!(received, payload.len());
         assert!(largest_slice <= 64 * 1024, "slice size was {largest_slice}");
+    }
+
+    #[test]
+    fn uploaded_files_are_downloadable_with_spaces_and_chunked() {
+        let dir = unique_temp_dir("upload_then_download");
+        std::fs::create_dir_all(&dir).unwrap();
+        let _guard = TempDirGuard(dir.clone());
+        let seed_file = dir.join("seed.txt");
+        std::fs::write(&seed_file, b"seed").unwrap();
+        let upload_dir = dir.join("uploads");
+        std::fs::create_dir_all(&upload_dir).unwrap();
+
+        let (token, port, handle, state) = start_test_server();
+        {
+            let mut st = lock_state(&state);
+            st.mode = "send".to_string();
+            st.files = vec!["seed.txt".to_string()];
+            st.shared_paths = vec![seed_file.clone()];
+            st.zip_roots = vec![seed_file];
+            st.dest_dir = upload_dir;
+        }
+
+        // Upload 1: Content-Length with spaces in filename (becomes index 1)
+        let body1 = b"video-bytes";
+        let req1 = format!(
+            "POST /{}/upload?name=Screencast%20From%202026-10-24%2019-57-28.mp4 HTTP/1.1\r\nHost: localhost\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+            token,
+            body1.len()
+        );
+        let mut s1 = TcpStream::connect(("127.0.0.1", port)).unwrap();
+        s1.write_all(req1.as_bytes()).unwrap();
+        s1.write_all(body1).unwrap();
+        let (st1, _, _) = read_response(&mut s1);
+        assert_eq!(st1, 200);
+
+        // Upload 2: Chunked encoding (becomes index 2)
+        let body2 = b"chunked-video";
+        let req2 = format!(
+            "POST /{}/upload?name=Clip%20Two.mp4 HTTP/1.1\r\nHost: localhost\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n{:x}\r\n",
+            token,
+            body2.len()
+        );
+        let mut s2 = TcpStream::connect(("127.0.0.1", port)).unwrap();
+        s2.write_all(req2.as_bytes()).unwrap();
+        s2.write_all(body2).unwrap();
+        s2.write_all(b"\r\n0\r\n\r\n").unwrap();
+        let (st2, _, _) = read_response(&mut s2);
+        assert_eq!(st2, 200);
+
+        // Both uploaded files must be downloadable at their /status indices
+        let (dl1_status, dl1_body) = http_get(
+            port,
+            &format!(
+                "/{}/download/1/Screencast%20From%202026-10-24%2019-57-28.mp4",
+                token
+            ),
+        );
+        assert_eq!(dl1_status, 200);
+        assert_eq!(dl1_body, body1);
+
+        let (dl2_status, dl2_body) = http_get(port, &format!("/{}/download/2/Clip%20Two.mp4", token));
+        assert_eq!(dl2_status, 200);
+        assert_eq!(dl2_body, body2);
+
+        // download-all.zip should also include the uploaded files
+        let (zip_status, zip_body) = http_get(port, &format!("/{}/download-all.zip", token));
+        assert_eq!(zip_status, 200);
+        let zip_str = String::from_utf8_lossy(&zip_body);
+        assert!(zip_str.contains("Screencast From 2026-10-24 19-57-28.mp4"));
+        assert!(zip_str.contains("Clip Two.mp4"));
+
+        let mut stop = TcpStream::connect(("127.0.0.1", port)).unwrap();
+        let stop_req = format!(
+            "POST /{}/stop HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n",
+            token
+        );
+        stop.write_all(stop_req.as_bytes()).unwrap();
+        let _ = read_response(&mut stop);
+        handle.join().unwrap();
     }
 
     struct TempDirGuard(std::path::PathBuf);
