@@ -1,5 +1,6 @@
 use std::env;
 use std::fs;
+use std::net::{IpAddr, Ipv4Addr};
 use std::os::unix::fs::PermissionsExt;
 use std::path::PathBuf;
 use std::process::{Command as StdCommand, ExitCode, Stdio};
@@ -49,8 +50,9 @@ fn run(cmd: Command) -> Result<(), String> {
             json,
         } => {
             let ip = network::detect_lan_ip();
+            let bind_host = IpAddr::V4(Ipv4Addr::UNSPECIFIED);
             let preferred = port.unwrap_or(5000);
-            let (listener, bound_port) = network::bind_listener(ip, preferred)
+            let (listener, bound_port) = network::bind_listener(bind_host, preferred)
                 .map_err(|e| format!("failed to bind port: {e}"))?;
             let token = network::generate_token();
             let url = format!("http://{}:{}/{}", ip, bound_port, token);
@@ -96,8 +98,9 @@ fn run(cmd: Command) -> Result<(), String> {
             json,
         } => {
             let ip = network::detect_lan_ip();
+            let bind_host = IpAddr::V4(Ipv4Addr::UNSPECIFIED);
             let preferred = port.unwrap_or(5001);
-            let (listener, bound_port) = network::bind_listener(ip, preferred)
+            let (listener, bound_port) = network::bind_listener(bind_host, preferred)
                 .map_err(|e| format!("failed to bind port: {e}"))?;
             let token = network::generate_token();
             let url = format!("http://{}:{}/{}", ip, bound_port, token);
@@ -109,6 +112,9 @@ fn run(cmd: Command) -> Result<(), String> {
                 );
             } else {
                 println!("lanbeam receive — listening on {}", url);
+                println!("  QR:");
+                let q = qr::QrCode::encode(&url).map_err(|e| format!("qr encode failed: {e}"))?;
+                println!("{}", q.to_ansi());
             }
 
             let session = server::ServerSession::new(listener, bound_port, &token)
@@ -138,13 +144,17 @@ fn run(cmd: Command) -> Result<(), String> {
             gui,
         } => {
             let ip = network::detect_lan_ip();
+            let bind_host = IpAddr::V4(Ipv4Addr::UNSPECIFIED);
             let preferred = port.unwrap_or(5002);
-            let (listener, bound_port) = network::bind_listener(ip, preferred)
+            let (listener, bound_port) = network::bind_listener(bind_host, preferred)
                 .map_err(|e| format!("failed to bind port: {e}"))?;
             let token = network::generate_token();
             let url = format!("http://{}:{}/{}", ip, bound_port, token);
 
             println!("lanbeam text — {}", url);
+            println!("  QR:");
+            let q = qr::QrCode::encode(&url).map_err(|e| format!("qr encode failed: {e}"))?;
+            println!("{}", q.to_ansi());
 
             let session = server::ServerSession::new(listener, bound_port, &token)
                 .map_err(|e| format!("failed to start server: {e}"))?;

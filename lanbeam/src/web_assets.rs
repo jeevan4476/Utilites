@@ -163,6 +163,24 @@ h2 {
   margin-top: 14px;
 }
 
+.session-qr-wrap {
+  margin-top: 14px;
+  padding: 12px;
+  background: #ffffff;
+  border: 1px solid var(--color-border);
+  border-radius: 10px;
+  display: flex;
+  justify-content: center;
+  align-items: center;
+}
+
+.session-qr-wrap img {
+  display: block;
+  width: 168px;
+  height: 168px;
+  image-rendering: pixelated;
+}
+
 /* ---------- Shared text banner ---------- */
 
 .shared-text {
@@ -495,6 +513,9 @@ footer {
               Download all (.zip)
             </button>
           </div>
+          <div class="session-qr-wrap hidden" id="session-qr-wrap">
+            <img id="session-qr" alt="Session QR code" />
+          </div>
         </div>
       </section>
 
@@ -766,6 +787,20 @@ class LanbeamUI {
     this.setText("session-active", s.active ? "Active" : "Inactive");
     this.setText("session-counters", `Downloads: ${s.downloads_completed} · Uploads: ${s.uploads_received}`);
     this.setText("session-time", s.remaining_seconds > 0 ? `Time left: ${Math.ceil(s.remaining_seconds / 60)} min` : "No time limit");
+    const qrWrap = this.el("session-qr-wrap");
+    const qrImg = this.el("session-qr");
+    const token = this.activeToken();
+    if (qrWrap?.classList && qrImg) {
+      if (token) {
+        const qrSrc = `${this.state.baseUrl}/${token}/qr.svg`;
+        if (qrImg.src !== qrSrc) {
+          qrImg.src = qrSrc;
+        }
+        qrWrap.classList.remove("hidden");
+      } else {
+        qrWrap.classList.add("hidden");
+      }
+    }
     const sharedTextEl = this.el("shared-text");
     const sharedTextBody = this.el("shared-text-body");
     if (s.shared_text) {

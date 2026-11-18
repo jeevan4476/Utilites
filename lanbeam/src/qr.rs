@@ -163,32 +163,38 @@ impl QrCode {
         let mut modules = vec![false; n * n];
         let mut function = vec![false; n * n];
         place_function_patterns(version, n, &mut modules, &mut function);
+        place_format_and_version(version, n, best_mask, &mut modules, &mut function);
         place_data(version, n, &interleaved, &mut modules, &function);
         apply_mask(best_mask, n, &function, &mut modules);
-        place_format_and_version(version, n, best_mask, &mut modules, &mut function);
 
         Ok(QrCode { size: n, modules })
     }
 
-    /// Terminal rendering using half-blocks: two rows per QR row pair.
+    /// Terminal rendering using half-blocks with a 2-module white quiet zone
+    /// and explicit ANSI white background / black foreground so it scans cleanly
+    /// on both dark and light terminals.
     pub fn to_ansi(&self) -> String {
+        const QUIET: usize = 2;
         let n = self.size;
+        let total_w = n + QUIET * 2;
+        let total_h = n + QUIET * 2;
         let mut out = String::new();
-        // Top border.
-        out.push_str(" ");
-        for _ in 0..n {
-            out.push('▄');
-        }
-        out.push('\n');
+
+        let is_dark = |x: usize, y: usize| -> bool {
+            if x < QUIET || x >= QUIET + n || y < QUIET || y >= QUIET + n {
+                false
+            } else {
+                self.modules[(y - QUIET) * n + (x - QUIET)]
+            }
+        };
 
         let mut row = 0;
-        while row < n {
-            out.push('█'); // left border
-            let mut col = 0;
-            while col < n {
-                let top = self.modules[row * n + col];
-                let bottom = if row + 1 < n {
-                    self.modules[(row + 1) * n + col]
+        while row < total_h {
+            out.push_str("\x1b[107;30m");
+            for col in 0..total_w {
+                let top = is_dark(col, row);
+                let bottom = if row + 1 < total_h {
+                    is_dark(col, row + 1)
                 } else {
                     false
                 };
@@ -198,28 +204,21 @@ impl QrCode {
                     (false, true) => '▄',
                     (true, true) => '█',
                 });
-                col += 1;
             }
-            out.push('█'); // right border
-            out.push('\n');
+            out.push_str("\x1b[0m\n");
             row += 2;
         }
-        // Bottom border.
-        out.push(' ');
-        for _ in 0..n {
-            out.push('▀');
-        }
-        out.push('\n');
         out
     }
 
-    /// SVG rendering for the GTK4 popup and browser views.
+    /// SVG rendering with a 4-module white quiet zone for popup and browser views.
     pub fn to_svg(&self, scale: u32) -> String {
+        const QUIET: u32 = 4;
         let n = self.size;
-        let dim = (n as u32) * scale;
+        let dim = ((n as u32) + QUIET * 2) * scale;
         let mut out = String::new();
         out.push_str(&format!(
-            "<svg xmlns=\"http://www.w3.org/2000/svg\" viewBox=\"0 0 {dim} {dim}\" width=\"{dim}\" height=\"{dim}\">\n",
+            "<svg xmlns=\"http://www.w3.org/2000/svg\" viewBox=\"0 0 {dim} {dim}\" width=\"{dim}\" height=\"{dim}\" shape-rendering=\"crispEdges\">\n",
         ));
         out.push_str(&format!(
             "  <rect width=\"{dim}\" height=\"{dim}\" fill=\"#ffffff\"/>\n",
@@ -235,9 +234,9 @@ impl QrCode {
                         out.push(' ');
                     }
                     out.push_str(&format!(
-                        "M{} {}h{}v{}h{}Z",
-                        (x as u32) * scale,
-                        (y as u32) * scale,
+                        "M{} {}h{}v{}h-{}Z",
+                        ((x as u32) + QUIET) * scale,
+                        ((y as u32) + QUIET) * scale,
                         scale,
                         scale,
                         scale
@@ -266,15 +265,15 @@ fn gf_tables() -> (&'static [u32; 512], &'static [u32; 256]) {
     let exp = EXP_TABLE.get_or_init(|| {
         let mut tab = [0u32; 512];
         let mut x: u32 = 1;
-        for i in 0..256 {
-            tab[i as usize] = x;
+        for i in 0..255 {
+            tab[i] = x;
             x <<= 1;
             if x & 0x100 != 0 {
                 x ^= GF_POLY;
             }
         }
-        for i in 256..512 {
-            tab[i as usize] = tab[i as usize - 256];
+        for i in 255..512 {
+            tab[i] = tab[i - 255];
         }
         tab
     });
@@ -427,10 +426,10 @@ fn char_count_bits(_data_len: usize, version: u8) -> usize {
 
 /// Finder pattern (7x7) dark cell at local coordinate (dx, dy).
 fn is_finder_dark(dx: usize, dy: usize) -> bool {
-    if dy == 1 || dy == 5 {
-        (1..=5).contains(&dx)
-    } else if dy >= 2 && dy <= 4 {
-        dx == 1 || dx == 5
+    if dx == 0 || dx == 6 || dy == 0 || dy == 6 {
+        true
+    } else if (2..=4).contains(&dx) && (2..=4).contains(&dy) {
+        true
     } else {
         false
     }
@@ -492,6 +491,25 @@ fn place_function_patterns(version: u8, n: usize, modules: &mut [bool], function
     finder(modules, function, n, n - 7, 0); // top-right
     finder(modules, function, n, 0, n - 7); // bottom-left
 
+    // Separators (1-module white border around each 7x7 finder pattern).
+    for i in 0..8 {
+        // Top-left separator
+        set_mod(modules, n, 7, i, false);
+        setf(function, 7, i);
+        set_mod(modules, n, i, 7, false);
+        setf(function, i, 7);
+        // Top-right separator
+        set_mod(modules, n, n - 8, i, false);
+        setf(function, n - 8, i);
+        set_mod(modules, n, n - 8 + i, 7, false);
+        setf(function, n - 8 + i, 7);
+        // Bottom-left separator
+        set_mod(modules, n, i, n - 8, false);
+        setf(function, i, n - 8);
+        set_mod(modules, n, 7, n - 8 + i, false);
+        setf(function, 7, n - 8 + i);
+    }
+
     // Alignment patterns (version 2+).
     let align_positions = align_positions(version);
     for &cx in &align_positions {
@@ -514,32 +532,21 @@ fn place_function_patterns(version: u8, n: usize, modules: &mut [bool], function
         }
     }
 
-    // Timing patterns (row 6 and column 6).
-    for i in 0..n {
-        if i == 6 {
-            continue;
-        }
-        // Vertical timing (col 6).
-        if !function[6 * n + i] {
+    // Timing patterns (row 6 and column 6, between separators).
+    for i in 8..n.saturating_sub(8) {
+        if !function[i * n + 6] {
             set_mod(modules, n, 6, i, i % 2 == 0);
             setf(function, 6, i);
         }
-        // Horizontal timing (row 6).
-        if !function[i * n + 6] {
+        if !function[6 * n + i] {
             set_mod(modules, n, i, 6, i % 2 == 0);
             setf(function, i, 6);
         }
     }
 
-    // Dark module at (n-8, 8)? Actually version-dependent: (4*version+9, ... ) no.
-    // The dark module is always at (8, n-8)... let me place at (4*version + 9, ...)?
-    // Standard dark module location: (4*version + 9, 8)... no. It's fixed relative.
-    // Simplest correct: module (n - 8, 8) ... hmm. ZXing places dark module at
-    // (4*version+9 mod ... ). For v1-6 it's effectively always present; use
-    // (8, n-8)? Let's place dark module at (n-8, 8) which is the conventional spot
-    // near bottom-left finder for v1+.
-    let dm_x = n - 8;
-    let dm_y = 8;
+    // Dark module at (8, 4 * version + 9) == (8, n - 8).
+    let dm_x = 8;
+    let dm_y = n - 8;
     if dm_x < n && dm_y < n {
         set_mod(modules, n, dm_x, dm_y, true);
         setf(function, dm_x, dm_y);
@@ -549,24 +556,17 @@ fn place_function_patterns(version: u8, n: usize, modules: &mut [bool], function
 fn align_positions(version: u8) -> Vec<usize> {
     match version {
         1 => vec![],
-        2 => vec![6],
-        3 => vec![6, 12],
-        4 => vec![6, 14],
-        5 => vec![6, 16],
-        6 => vec![6, 18],
+        2 => vec![6, 18],
+        3 => vec![6, 22],
+        4 => vec![6, 26],
+        5 => vec![6, 30],
+        6 => vec![6, 34],
         _ => vec![],
     }
 }
 
 fn is_finder_area(n: usize, cx: usize, cy: usize) -> bool {
-    let finder_centers = [(3, 3), (n - 7, 3), (3, n - 7)];
-    for &(fx, fy) in &finder_centers {
-        if cx >= fx.saturating_sub(2) && cx <= fx + 2 && cy >= fy.saturating_sub(2) && cy <= fy + 2
-        {
-            return true;
-        }
-    }
-    false
+    (cx <= 7 && cy <= 7) || (cx >= n - 8 && cy <= 7) || (cx <= 7 && cy >= n - 8)
 }
 
 fn place_format_and_version(
@@ -578,28 +578,44 @@ fn place_format_and_version(
 ) {
     let setf = |f: &mut [bool], x: usize, y: usize| f[y * n + x] = true;
     let format_bits = format_info_bits(mask); // 15 bits, MSB first
-                                              // Place around top-left finder:
-                                              // bit i (0..=7): (8, 8-i) for i=0..8 except i=6 → (8,8);
-                                              // Standard placement:
-    for i in 0..9 {
-        let bit = format_bits[i];
-        let (x, y) = if i < 8 { (8, 7 - i) } else { (8, 8) };
-        if x < n && y < n {
-            set_mod(modules, n, x, y, bit != 0);
-        }
+
+    // Copy 1: around top-left finder pattern.
+    // Bit 14 (MSB = format_bits[0]) -> (8, 0) down to (8, 8), then (7, 8) left to (0, 8).
+    let copy1: [(usize, usize); 15] = [
+        (8, 0),
+        (8, 1),
+        (8, 2),
+        (8, 3),
+        (8, 4),
+        (8, 5),
+        (8, 7),
+        (8, 8),
+        (7, 8),
+        (5, 8),
+        (4, 8),
+        (3, 8),
+        (2, 8),
+        (1, 8),
+        (0, 8),
+    ];
+    for (i, &(x, y)) in copy1.iter().enumerate() {
+        set_mod(modules, n, x, y, format_bits[i] != 0);
         setf(function, x, y);
     }
-    // Along column 8 going up from bottom-left area:
-    for i in 0..6 {
-        let bit = format_bits[9 + i];
-        let x = n - 1 - i;
+
+    // Copy 2: bottom-left (col 8, rows n-1..=n-7) and top-right (row 8, cols n-8..n).
+    for i in 0..7 {
+        let x = 8;
+        let y = n - 1 - i;
+        set_mod(modules, n, x, y, format_bits[i] != 0);
+        setf(function, x, y);
+    }
+    for i in 7..15 {
+        let x = n - 8 + (i - 7);
         let y = 8;
-        if x < n && y < n {
-            set_mod(modules, n, x, y, bit != 0);
-        }
+        set_mod(modules, n, x, y, format_bits[i] != 0);
         setf(function, x, y);
     }
-    // Module (n-8, 8)? already set as dark; format occupies (n-8..n-1, 8) — overlaps handled by function mask.
 
     // Version info not needed for versions < 7.
     let _ = version;
@@ -647,10 +663,9 @@ fn place_data(version: u8, n: usize, codewords: &[u8], modules: &mut [bool], fun
 
     // Clean zigzag placement (pair of columns, right to left).
     let mut idx = 0usize;
-    let mut col = n;
+    let mut col: isize = n as isize - 1;
     let mut up = true;
     while col > 0 {
-        col -= 1;
         if col == 6 {
             col -= 1;
         }
@@ -661,7 +676,7 @@ fn place_data(version: u8, n: usize, codewords: &[u8], modules: &mut [bool], fun
         };
         for &r in &rows {
             for dc in [0isize, -1] {
-                let c = col as isize + dc;
+                let c = col + dc;
                 if c < 0 || c >= n as isize {
                     continue;
                 }
@@ -677,6 +692,7 @@ fn place_data(version: u8, n: usize, codewords: &[u8], modules: &mut [bool], fun
             }
         }
         up = !up;
+        col -= 2;
     }
     let _ = version;
 }
@@ -869,5 +885,39 @@ mod tests {
         // v1-L byte mode capacity is 17 bytes.
         let s = "A".repeat(17);
         assert!(QrCode::encode(&s).is_ok());
+    }
+
+    #[test]
+    fn finder_separators_dark_module_and_quiet_zone_valid() {
+        let url = "http://192.168.1.5:5000/AbCdEf123456";
+        let qr = QrCode::encode(url).expect("encode url");
+        let n = qr.size;
+        assert_eq!(n, 29); // version 3
+
+        // Top-left finder: outer border dark, inner ring light, center 3x3 dark
+        assert!(qr.module(0, 0));
+        assert!(qr.module(6, 6));
+        assert!(!qr.module(1, 1));
+        assert!(!qr.module(5, 5));
+        assert!(qr.module(3, 3));
+
+        // 1-module white separator around top-left finder
+        for i in 0..8 {
+            assert!(!qr.module(7, i));
+            assert!(!qr.module(i, 7));
+        }
+
+        // Fixed dark module at (8, n - 8)
+        assert!(qr.module(8, n - 8));
+
+        // Terminal ANSI includes explicit white background + reset and quiet zone
+        let ansi = qr.to_ansi();
+        assert!(ansi.contains("\x1b[107;30m"));
+        assert!(ansi.contains("\x1b[0m"));
+
+        // SVG includes 4-module quiet zone around 29x29 -> (29 + 8) * 4 = 148
+        let svg = qr.to_svg(4);
+        assert!(svg.contains("viewBox=\"0 0 148 148\""));
+        assert!(svg.contains("h-4Z"));
     }
 }

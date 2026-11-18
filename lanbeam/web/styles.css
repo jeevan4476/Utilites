@@ -149,6 +149,24 @@ h2 {
   margin-top: 14px;
 }
 
+.session-qr-wrap {
+  margin-top: 14px;
+  padding: 12px;
+  background: #ffffff;
+  border: 1px solid var(--color-border);
+  border-radius: 10px;
+  display: flex;
+  justify-content: center;
+  align-items: center;
+}
+
+.session-qr-wrap img {
+  display: block;
+  width: 168px;
+  height: 168px;
+  image-rendering: pixelated;
+}
+
 /* ---------- Shared text banner ---------- */
 
 .shared-text {

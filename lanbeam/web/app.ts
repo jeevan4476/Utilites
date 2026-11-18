@@ -304,6 +304,22 @@ export class LanbeamUI {
         : "No time limit"
     );
 
+    // Session QR code.
+    const qrWrap = this.el("session-qr-wrap");
+    const qrImg = this.el("session-qr") as HTMLImageElement | null;
+    const token = this.activeToken();
+    if (qrWrap?.classList && qrImg) {
+      if (token) {
+        const qrSrc = `${this.state.baseUrl}/${token}/qr.svg`;
+        if (qrImg.src !== qrSrc) {
+          qrImg.src = qrSrc;
+        }
+        qrWrap.classList.remove("hidden");
+      } else {
+        qrWrap.classList.add("hidden");
+      }
+    }
+
     // Shared text banner.
     const sharedTextEl = this.el("shared-text");
     const sharedTextBody = this.el("shared-text-body");
