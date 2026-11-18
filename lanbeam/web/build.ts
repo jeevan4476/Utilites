@@ -63,7 +63,7 @@ async function main() {
   let initJs = initMatch[1];
   // Remove the import line since app.ts is now inlined above.
   initJs = initJs.replace(
-    /import\s*\{\s*LanbeamUI\s*\}\s*from\s*["']\.\/app\.ts["']\s*;?\n?/,
+    /import\s*\{[^}]*\}\s*from\s*["']\.\/app\.ts["']\s*;?\n?/,
     ""
   );
 

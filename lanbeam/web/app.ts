@@ -67,6 +67,14 @@ export function clamp(value: number, min: number, max: number): number {
   return Math.min(Math.max(value, min), max);
 }
 
+export function resolveSessionToken(embeddedToken?: string, pathToken?: string): string {
+  for (const candidate of [embeddedToken, pathToken]) {
+    const token = candidate?.trim() ?? "";
+    if (token && token !== "–" && token !== "-") return token;
+  }
+  return "";
+}
+
 // ---------------------------------------------------------------------------
 // API client
 // ---------------------------------------------------------------------------
@@ -111,6 +119,13 @@ export class LanbeamApi {
       body: JSON.stringify({ text }),
     });
   }
+
+  /** Stop the active sharing session via POST /<token>/stop. */
+  async stopSession(): Promise<void> {
+    await this.request("/stop", {
+      method: "POST",
+    });
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -121,23 +136,50 @@ export class LanbeamUI {
   private state: AppState;
   private api: LanbeamApi;
   private pollTimer: number | null = null;
-  private lastBytes = 0;
-  private lastTime = 0;
 
   // DOM elements (cached after first render).
   private els: Record<string, HTMLElement | null> = {};
 
   constructor(token: string, baseUrl: string) {
+    // Seed initial state from server-injected global if present
+    const initialState = (window as any).__LANBEAM_INITIAL_STATE__ as
+      | { token?: string; mode?: string; url?: string; files?: string[]; downloads_completed?: number; uploads_received?: number; shared_text?: string | null; remaining_seconds?: number; active?: boolean }
+      | undefined;
+    const embeddedToken = initialState?.token?.trim();
+    const pathToken = (window as any).location?.pathname?.split("/").filter(Boolean)[0] || "";
+    const resolvedToken = resolveSessionToken(embeddedToken, pathToken) || token;
+    const cleanBase = baseUrl.replace(/\/+$/, "");
+    const rootBase =
+      resolvedToken && cleanBase.endsWith(`/${resolvedToken}`)
+        ? cleanBase.slice(0, -(resolvedToken.length + 1))
+        : cleanBase;
+    const apiBase = resolvedToken ? `${rootBase}/${resolvedToken}` : rootBase;
+
     this.state = {
-      token,
-      baseUrl,
-      session: null,
+      token: resolvedToken,
+      baseUrl: rootBase,
+      session: initialState
+        ? {
+            token: resolvedToken || undefined,
+            mode: (initialState.mode as any) || "send",
+            url: initialState.url || "",
+            files: initialState.files || [],
+            downloads_completed: initialState.downloads_completed || 0,
+            uploads_received: initialState.uploads_received || 0,
+            shared_text: initialState.shared_text ?? null,
+            remaining_seconds: initialState.remaining_seconds || 0,
+            active: initialState.active ?? true,
+          }
+        : null,
       files: [],
       uploads: [],
       theme: "light",
       polling: false,
     };
-    this.api = new LanbeamApi(baseUrl);
+    if (this.state.session) {
+      this.syncFilesFromSession(this.state.session);
+    }
+    this.api = new LanbeamApi(apiBase);
     this.initTheme();
   }
 
@@ -152,7 +194,7 @@ export class LanbeamUI {
   stop(): void {
     this.state.polling = false;
     if (this.pollTimer !== null) {
-      clearInterval(this.pollTimer);
+      clearTimeout(this.pollTimer);
       this.pollTimer = null;
     }
   }
@@ -165,25 +207,36 @@ export class LanbeamUI {
         // Keep polling; the server may be restarting.
       })
       .finally(() => {
-        this.pollTimer = window.setTimeout(() => this.poll(), 1000);
+        if (this.state.polling) {
+          this.pollTimer = window.setTimeout(() => this.poll(), 1000);
+        }
       });
   }
 
   private async refreshStatus(): Promise<void> {
     const session = await this.api.getStatus();
+    if (session.token) {
+      this.state.token = session.token;
+    }
     this.state.session = session;
     this.syncFilesFromSession(session);
     this.render();
+    if (!session.active) {
+      this.stop();
+    }
   }
 
   private syncFilesFromSession(session: SessionState): void {
     // Merge session file list into our local file model, preserving progress.
-    const byName = new Map(this.state.files.map((f) => [f.name, f]));
-    const next: FileInfo[] = session.files.map((name) => {
-      const existing = byName.get(name);
+    const byKey = new Map(
+      this.state.files.map((f) => [`${f.index}:${f.name}`, f])
+    );
+    const next: FileInfo[] = session.files.map((name, index) => {
+      const existing = byKey.get(`${index}:${name}`);
       if (existing) return existing;
       return {
         name,
+        index,
         size: 0,
         downloaded: false,
         progress: 0,
@@ -233,6 +286,7 @@ export class LanbeamUI {
     if (!s) return;
 
     // Session header.
+    this.setText("session-token", this.state.token || s.token || "–");
     this.setText("session-url", s.url);
     this.setText("session-mode", s.mode.charAt(0).toUpperCase() + s.mode.slice(1));
     this.setText(
@@ -290,7 +344,12 @@ export class LanbeamUI {
 
     const sizeCell = document.createElement("div");
     sizeCell.className = "file-size";
-    sizeCell.textContent = f.size > 0 ? formatBytes(f.size) : "–";
+    let sizeText = f.size > 0 ? formatBytes(f.size) : "–";
+    if (f.speed !== undefined && f.speed > 0) {
+      sizeText += ` · ${formatSpeed(f.speed)}`;
+      if (f.eta) sizeText += ` · ETA ${f.eta}`;
+    }
+    sizeCell.textContent = sizeText;
 
     const progCell = document.createElement("div");
     progCell.className = "file-progress";
@@ -351,7 +410,12 @@ export class LanbeamUI {
 
     const sizeCell = document.createElement("div");
     sizeCell.className = "upload-size";
-    sizeCell.textContent = `${formatBytes(u.uploaded)} / ${formatBytes(u.size)}`;
+    let sizeText = `${formatBytes(u.uploaded)} / ${formatBytes(u.size)}`;
+    if (u.speed !== undefined && u.speed > 0) {
+      sizeText += ` · ${formatSpeed(u.speed)}`;
+      if (u.eta) sizeText += ` · ETA ${u.eta}`;
+    }
+    sizeCell.textContent = sizeText;
 
     const progCell = document.createElement("div");
     progCell.className = "upload-progress";
@@ -371,31 +435,98 @@ export class LanbeamUI {
 
   // -- actions ------------------------------------------------------------
 
+  private activeToken(): string {
+    return this.state.token || this.state.session?.token || "";
+  }
+
   async downloadFile(file: FileInfo): Promise<void> {
-    if (!this.state.session) return;
-    const { token } = this.state.session;
-    const url = `${this.state.baseUrl}/${token}/download/${encodeURIComponent(file.name)}`;
+    const token = this.activeToken();
+    if (!token) return;
+    // Segment-encode the file name (encode each path segment separately)
+    const encodedName = file.name.split("/").map(encodeURIComponent).join("/");
+    const url = `${this.state.baseUrl}/${token}/download/${file.index}/${encodedName}`;
+    let reader: ReadableStreamDefaultReader<Uint8Array> | undefined;
     try {
       file.status = "downloading";
       file.progress = 0;
       this.renderFiles();
 
       const res = await fetch(url);
-      const blob = await res.blob();
-      const downloadUrl = URL.createObjectURL(blob);
-      const a = document.createElement("a");
-      a.href = downloadUrl;
-      a.download = file.name;
-      document.body.appendChild(a);
-      a.click();
-      document.body.removeChild(a);
-      URL.revokeObjectURL(downloadUrl);
+      if (!res.ok) {
+        throw new Error(`HTTP ${res.status}`);
+      }
+      const contentLength = Number(res.headers?.get("Content-Length"));
+      if ((!Number.isFinite(file.size) || file.size <= 0) && Number.isFinite(contentLength) && contentLength > 0) {
+        file.size = contentLength;
+      }
+
+      // Streaming download with progress when supported
+      if (res.body && typeof res.body.getReader === "function") {
+        reader = res.body.getReader();
+        const chunks: BlobPart[] = [];
+        let received = 0;
+        let lastTime = Date.now();
+        let lastReceived = 0;
+        while (true) {
+          const { done, value } = await reader.read();
+          if (done) break;
+          const chunkCopy = new Uint8Array(value.byteLength);
+          chunkCopy.set(value);
+          chunks.push(chunkCopy.buffer);
+          received += value.length;
+          if (file.size > 0) {
+            file.progress = clamp(Math.round((received / file.size) * 100), 0, 100);
+          }
+          const now = Date.now();
+          const dt = (now - lastTime) / 1000;
+          if (dt > 0) {
+            file.speed = Math.round((received - lastReceived) / dt);
+            const remaining = Math.max(0, (file.size || 0) - received);
+            file.eta = formatETA(remaining, file.speed);
+          }
+          lastReceived = received;
+          lastTime = now;
+          this.renderFiles();
+        }
+        const blob = new Blob(chunks);
+        const downloadUrl = URL.createObjectURL(blob);
+        try {
+          const a = document.createElement("a");
+          a.href = downloadUrl;
+          a.download = extractFilename(file.name);
+          document.body.appendChild(a);
+          a.click();
+          document.body.removeChild(a);
+        } finally {
+          URL.revokeObjectURL(downloadUrl);
+        }
+      } else {
+        const blob = await res.blob();
+        const downloadUrl = URL.createObjectURL(blob);
+        try {
+          const a = document.createElement("a");
+          a.href = downloadUrl;
+          a.download = extractFilename(file.name);
+          document.body.appendChild(a);
+          a.click();
+          document.body.removeChild(a);
+        } finally {
+          URL.revokeObjectURL(downloadUrl);
+        }
+      }
 
       file.status = "done";
       file.progress = 100;
       file.downloaded = true;
+      file.speed = undefined;
+      file.eta = undefined;
     } catch (err) {
+      if (reader) {
+        try { await reader.cancel(); } catch { /* stream already failed or closed */ }
+      }
       file.status = "error";
+      file.speed = undefined;
+      file.eta = undefined;
       console.error("lanbeam: download failed:", err);
     } finally {
       this.renderFiles();
@@ -403,18 +534,22 @@ export class LanbeamUI {
   }
 
   async openFile(file: FileInfo): Promise<void> {
-    if (!this.state.session) return;
-    const { token } = this.state.session;
-    const url = `${this.state.baseUrl}/${token}/download/${encodeURIComponent(file.name)}`;
+    const token = this.activeToken();
+    if (!token) return;
+    const encodedName = file.name.split("/").map(encodeURIComponent).join("/");
+    const url = `${this.state.baseUrl}/${token}/download/${file.index}/${encodedName}`;
     window.open(url, "_blank");
   }
 
   async downloadAll(): Promise<void> {
-    if (!this.state.session) return;
-    const { token } = this.state.session;
+    const token = this.activeToken();
+    if (!token) return;
     const url = `${this.state.baseUrl}/${token}/download-all.zip`;
     try {
       const res = await fetch(url);
+      if (!res.ok) {
+        throw new Error(`HTTP ${res.status}`);
+      }
       const blob = await res.blob();
       const downloadUrl = URL.createObjectURL(blob);
       const a = document.createElement("a");
@@ -430,39 +565,19 @@ export class LanbeamUI {
     }
   }
 
-  // Handle multi-file upload from an <input type=file>.
+  // Handle multi-file upload from an <input type=file> or drag-and-drop.
   async queueUploads(files: FileList | null): Promise<void> {
-    if (!files) return;
-    const arr = Array.from(files);
-    for (const file of arr) {
-      const up: UploadInfo = {
-        name: file.name,
-        size: file.size,
-        uploaded: 0,
-        progress: 0,
-        status: "queued",
-      };
-      this.state.uploads.push(up);
-    }
-    this.renderUploads();
-    for (const up of this.state.uploads) {
-      if (up.status !== "queued") continue;
-      await this.performUpload(up);
+    if (!files || files.length === 0) return;
+    for (const file of Array.from(files)) {
+      try {
+        await this.uploadFileWithProgress(file);
+      } catch (err) {
+        console.error("lanbeam: upload failed:", err);
+      }
     }
   }
 
-  private performUpload(up: UploadInfo): Promise<void> {
-    return new Promise((resolve) => {
-      const input = document.createElement("input");
-      input.type = "file";
-      // We don't have the actual File object reference here easily; instead
-      // the caller should use uploadFile directly. Keep this as a stub that
-      // resolves immediately when called via queueUploads with real files.
-      resolve();
-    });
-  }
-
-  /** Upload a single File object with XHR progress tracking. */
+  /** Upload a single File object with XHR progress tracking and live speed/ETA. */
   uploadFileWithProgress(file: File): Promise<void> {
     const up: UploadInfo = {
       name: file.name,
@@ -475,20 +590,45 @@ export class LanbeamUI {
     this.renderUploads();
 
     return new Promise((resolve, reject) => {
-      if (!this.state.session) {
-        reject(new Error("no session"));
+      const token = this.activeToken();
+      if (!token) {
+        up.status = "error";
+        this.renderUploads();
+        reject(new Error("no session token"));
         return;
       }
-      const { token } = this.state.session;
       const url = `${this.state.baseUrl}/${token}/upload?name=${encodeURIComponent(up.name)}`;
       const xhr = new XMLHttpRequest();
-      xhr.open("POST", url, true);
+      try {
+        xhr.open("POST", url, true);
+      } catch (err) {
+        up.status = "error";
+        this.renderUploads();
+        reject(err);
+        return;
+      }
+
+      let lastBytes = 0;
+      let lastTime = Date.now();
 
       xhr.upload.addEventListener("progress", (ev) => {
         if (ev.lengthComputable) {
           up.uploaded = ev.loaded;
           up.size = ev.total;
-          up.progress = Math.round((ev.loaded / ev.total) * 100);
+          up.progress = ev.total > 0 ? clamp(Math.round((ev.loaded / ev.total) * 100), 0, 100) : 0;
+
+          // Compute live speed/ETA
+          const now = Date.now();
+          const dt = (now - lastTime) / 1000;
+          if (dt > 0 && ev.total > 0) {
+            const delta = ev.loaded - lastBytes;
+            up.speed = Math.round(delta / dt);
+            const remaining = Math.max(0, (up.size || 0) - ev.loaded);
+            up.eta = formatETA(remaining, up.speed);
+          }
+          lastBytes = ev.loaded;
+          lastTime = now;
+
           this.renderUploads();
         }
       });
@@ -498,10 +638,14 @@ export class LanbeamUI {
           up.status = "done";
           up.progress = 100;
           up.uploaded = up.size;
+          up.speed = undefined;
+          up.eta = undefined;
           this.renderUploads();
           resolve();
         } else {
           up.status = "error";
+          up.speed = undefined;
+          up.eta = undefined;
           this.renderUploads();
           reject(new Error(`Upload failed: ${xhr.status}`));
         }
@@ -509,11 +653,29 @@ export class LanbeamUI {
 
       xhr.addEventListener("error", () => {
         up.status = "error";
+        up.speed = undefined;
+        up.eta = undefined;
         this.renderUploads();
         reject(new Error("Upload network error"));
       });
 
-      xhr.send(file);
+      xhr.addEventListener("abort", () => {
+        up.status = "error";
+        up.speed = undefined;
+        up.eta = undefined;
+        this.renderUploads();
+        reject(new Error("Upload aborted"));
+      });
+
+      try {
+        xhr.send(file);
+      } catch (err) {
+        up.status = "error";
+        up.speed = undefined;
+        up.eta = undefined;
+        this.renderUploads();
+        reject(err);
+      }
     });
   }
 
@@ -526,26 +688,52 @@ export class LanbeamUI {
     }
   }
 
-  async copyLink(): Promise<void> {
-    const url = this.state.session?.url;
-    if (!url) return;
+  private async copyText(value: string, toastMessage: string): Promise<void> {
+    if (!value) return;
     try {
-      await navigator.clipboard.writeText(url);
-      this.showToast("Link copied to clipboard");
+      await navigator.clipboard.writeText(value);
+      this.showToast(toastMessage);
     } catch {
       // Fallback for older browsers.
       const ta = document.createElement("textarea");
-      ta.value = url;
+      ta.value = value;
       ta.style.position = "fixed";
       ta.style.opacity = "0";
       document.body.appendChild(ta);
       ta.select();
       try {
         document.execCommand("copy");
-        this.showToast("Link copied to clipboard");
+        this.showToast(toastMessage);
       } finally {
         document.body.removeChild(ta);
       }
+    }
+  }
+
+  async copyLink(): Promise<void> {
+    await this.copyText(
+      this.state.session?.url || "",
+      "Link copied to clipboard"
+    );
+  }
+
+  async copySharedText(): Promise<void> {
+    await this.copyText(
+      this.state.session?.shared_text || "",
+      "Text copied to clipboard"
+    );
+  }
+
+  async stopSharing(): Promise<void> {
+    try {
+      await this.api.stopSession();
+    } catch (err) {
+      console.error("lanbeam: stop session failed:", err);
+    }
+    this.stop();
+    if (this.state.session) {
+      this.state.session.active = false;
+      this.render();
     }
   }
 
@@ -581,11 +769,15 @@ export class LanbeamUI {
       themeBtn.addEventListener("click", () => this.toggleTheme());
     }
 
-    // Copy link button.
-    const copyBtn = root.querySelector('[data-action="copy-link"]');
-    if (copyBtn) {
-      copyBtn.addEventListener("click", () => this.copyLink());
-    }
+    // Copy link buttons (multiple).
+    root.querySelectorAll('[data-action="copy-link"]').forEach((btn) => {
+      btn.addEventListener("click", () => this.copyLink());
+    });
+
+    // Copy shared text buttons (multiple).
+    root.querySelectorAll('[data-action="copy-text"]').forEach((btn) => {
+      btn.addEventListener("click", () => this.copySharedText());
+    })
 
     // Download All button.
     const dlAllBtn = root.querySelector('[data-action="download-all"]');
@@ -646,7 +838,7 @@ export class LanbeamUI {
       | null;
     if (stopBtn) {
       stopBtn.addEventListener("click", () => {
-        this.stop();
+        void this.stopSharing();
       });
     }
   }

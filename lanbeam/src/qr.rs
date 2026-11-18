@@ -84,7 +84,11 @@ impl QrCode {
         Err(QrError::DataTooLong)
     }
 
-    fn encode_with_version(version: u8, data_codewords: &[u8], ec: EcBlock) -> Result<QrCode, QrError> {
+    fn encode_with_version(
+        version: u8,
+        data_codewords: &[u8],
+        ec: EcBlock,
+    ) -> Result<QrCode, QrError> {
         let total_data = ec.total_data as usize;
         if data_codewords.len() != total_data {
             return Err(QrError::Encode(format!(
@@ -351,13 +355,62 @@ struct EcBlock {
 
 // Indexed by version. Built from the ISO/IEC 18004 EC table (level L).
 const EC_BLOCKS: [EcBlock; 7] = [
-    EcBlock { total_data: 0, ec_per_block: 0, num_blocks_1: 0, data_per_block_1: 0, num_blocks_2: 0, data_per_block_2: 0 }, // v0 unused
-    EcBlock { total_data: 19,  ec_per_block: 7,  num_blocks_1: 1, data_per_block_1: 19, num_blocks_2: 0, data_per_block_2: 0 },  // 1-L
-    EcBlock { total_data: 34,  ec_per_block: 10, num_blocks_1: 1, data_per_block_1: 34, num_blocks_2: 0, data_per_block_2: 0 },  // 2-L
-    EcBlock { total_data: 55,  ec_per_block: 15, num_blocks_1: 1, data_per_block_1: 55, num_blocks_2: 0, data_per_block_2: 0 },  // 3-L
-    EcBlock { total_data: 80,  ec_per_block: 20, num_blocks_1: 1, data_per_block_1: 80, num_blocks_2: 0, data_per_block_2: 0 },  // 4-L
-    EcBlock { total_data: 108, ec_per_block: 26, num_blocks_1: 1, data_per_block_1: 108, num_blocks_2: 0, data_per_block_2: 0 }, // 5-L
-    EcBlock { total_data: 136, ec_per_block: 18, num_blocks_1: 2, data_per_block_1: 68, num_blocks_2: 0, data_per_block_2: 0 },  // 6-L
+    EcBlock {
+        total_data: 0,
+        ec_per_block: 0,
+        num_blocks_1: 0,
+        data_per_block_1: 0,
+        num_blocks_2: 0,
+        data_per_block_2: 0,
+    }, // v0 unused
+    EcBlock {
+        total_data: 19,
+        ec_per_block: 7,
+        num_blocks_1: 1,
+        data_per_block_1: 19,
+        num_blocks_2: 0,
+        data_per_block_2: 0,
+    }, // 1-L
+    EcBlock {
+        total_data: 34,
+        ec_per_block: 10,
+        num_blocks_1: 1,
+        data_per_block_1: 34,
+        num_blocks_2: 0,
+        data_per_block_2: 0,
+    }, // 2-L
+    EcBlock {
+        total_data: 55,
+        ec_per_block: 15,
+        num_blocks_1: 1,
+        data_per_block_1: 55,
+        num_blocks_2: 0,
+        data_per_block_2: 0,
+    }, // 3-L
+    EcBlock {
+        total_data: 80,
+        ec_per_block: 20,
+        num_blocks_1: 1,
+        data_per_block_1: 80,
+        num_blocks_2: 0,
+        data_per_block_2: 0,
+    }, // 4-L
+    EcBlock {
+        total_data: 108,
+        ec_per_block: 26,
+        num_blocks_1: 1,
+        data_per_block_1: 108,
+        num_blocks_2: 0,
+        data_per_block_2: 0,
+    }, // 5-L
+    EcBlock {
+        total_data: 136,
+        ec_per_block: 18,
+        num_blocks_1: 2,
+        data_per_block_1: 68,
+        num_blocks_2: 0,
+        data_per_block_2: 0,
+    }, // 6-L
 ];
 
 fn module_size(version: u8) -> usize {
@@ -435,16 +488,18 @@ fn place_function_patterns(version: u8, n: usize, modules: &mut [bool], function
             }
         }
     };
-    finder(modules, function, n, 0, 0);             // top-left
-    finder(modules, function, n, n - 7, 0);         // top-right
-    finder(modules, function, n, 0, n - 7);         // bottom-left
+    finder(modules, function, n, 0, 0); // top-left
+    finder(modules, function, n, n - 7, 0); // top-right
+    finder(modules, function, n, 0, n - 7); // bottom-left
 
     // Alignment patterns (version 2+).
     let align_positions = align_positions(version);
     for &cx in &align_positions {
         for &cy in &align_positions {
             // Skip if inside a finder pattern.
-            if is_finder_area(n, cx, cy) { continue; }
+            if is_finder_area(n, cx, cy) {
+                continue;
+            }
             for dy in 0..5 {
                 for dx in 0..5 {
                     let dark = is_align_dark(dx, dy);
@@ -461,7 +516,9 @@ fn place_function_patterns(version: u8, n: usize, modules: &mut [bool], function
 
     // Timing patterns (row 6 and column 6).
     for i in 0..n {
-        if i == 6 { continue; }
+        if i == 6 {
+            continue;
+        }
         // Vertical timing (col 6).
         if !function[6 * n + i] {
             set_mod(modules, n, 6, i, i % 2 == 0);
@@ -475,7 +532,7 @@ fn place_function_patterns(version: u8, n: usize, modules: &mut [bool], function
     }
 
     // Dark module at (n-8, 8)? Actually version-dependent: (4*version+9, ... ) no.
-    // The dark module is always at (8, n-8)... let me place at (4*version + 9, ...)? 
+    // The dark module is always at (8, n-8)... let me place at (4*version + 9, ...)?
     // Standard dark module location: (4*version + 9, 8)... no. It's fixed relative.
     // Simplest correct: module (n - 8, 8) ... hmm. ZXing places dark module at
     // (4*version+9 mod ... ). For v1-6 it's effectively always present; use
@@ -504,27 +561,29 @@ fn align_positions(version: u8) -> Vec<usize> {
 fn is_finder_area(n: usize, cx: usize, cy: usize) -> bool {
     let finder_centers = [(3, 3), (n - 7, 3), (3, n - 7)];
     for &(fx, fy) in &finder_centers {
-        if cx >= fx.saturating_sub(2) && cx <= fx + 2 &&
-           cy >= fy.saturating_sub(2) && cy <= fy + 2 {
+        if cx >= fx.saturating_sub(2) && cx <= fx + 2 && cy >= fy.saturating_sub(2) && cy <= fy + 2
+        {
             return true;
         }
     }
     false
 }
 
-fn place_format_and_version(version: u8, n: usize, mask: u8, modules: &mut [bool], function: &mut [bool]) {
+fn place_format_and_version(
+    version: u8,
+    n: usize,
+    mask: u8,
+    modules: &mut [bool],
+    function: &mut [bool],
+) {
     let setf = |f: &mut [bool], x: usize, y: usize| f[y * n + x] = true;
     let format_bits = format_info_bits(mask); // 15 bits, MSB first
-    // Place around top-left finder:
-    // bit i (0..=7): (8, 8-i) for i=0..8 except i=6 → (8,8); 
-    // Standard placement:
+                                              // Place around top-left finder:
+                                              // bit i (0..=7): (8, 8-i) for i=0..8 except i=6 → (8,8);
+                                              // Standard placement:
     for i in 0..9 {
         let bit = format_bits[i];
-        let (x, y) = if i < 8 {
-            (8, 7 - i)
-        } else {
-            (8, 8)
-        };
+        let (x, y) = if i < 8 { (8, 7 - i) } else { (8, 8) };
         if x < n && y < n {
             set_mod(modules, n, x, y, bit != 0);
         }
@@ -592,7 +651,9 @@ fn place_data(version: u8, n: usize, codewords: &[u8], modules: &mut [bool], fun
     let mut up = true;
     while col > 0 {
         col -= 1;
-        if col == 6 { col -= 1; }
+        if col == 6 {
+            col -= 1;
+        }
         let rows: Vec<isize> = if up {
             (0..n as isize).rev().collect()
         } else {
@@ -601,10 +662,14 @@ fn place_data(version: u8, n: usize, codewords: &[u8], modules: &mut [bool], fun
         for &r in &rows {
             for dc in [0isize, -1] {
                 let c = col as isize + dc;
-                if c < 0 || c >= n as isize { continue; }
+                if c < 0 || c >= n as isize {
+                    continue;
+                }
                 let x = c as usize;
                 let y = r as usize;
-                if function[y * n + x] { continue; }
+                if function[y * n + x] {
+                    continue;
+                }
                 if idx < bits.len() {
                     modules[y * n + x] = bits[idx] != 0;
                     idx += 1;
@@ -619,7 +684,9 @@ fn place_data(version: u8, n: usize, codewords: &[u8], modules: &mut [bool], fun
 fn apply_mask(mask: u8, n: usize, function: &[bool], modules: &mut [bool]) {
     for y in 0..n {
         for x in 0..n {
-            if function[y * n + x] { continue; }
+            if function[y * n + x] {
+                continue;
+            }
             let invert = match mask {
                 0 => (x + y) % 2 == 0,
                 1 => y % 2 == 0,
@@ -684,11 +751,15 @@ fn run_penalty_row(n: usize, y: usize, m: impl Fn(usize, usize) -> bool) -> u32 
         if m(x, y) == m(x - 1, y) {
             run += 1;
         } else {
-            if run >= 5 { p += 3 + (run - 5); }
+            if run >= 5 {
+                p += 3 + (run - 5);
+            }
             run = 1;
         }
     }
-    if run >= 5 { p += 3 + (run - 5); }
+    if run >= 5 {
+        p += 3 + (run - 5);
+    }
     p
 }
 
@@ -699,11 +770,15 @@ fn run_penalty_col(n: usize, x: usize, m: impl Fn(usize, usize) -> bool) -> u32 
         if m(x, y) == m(x, y - 1) {
             run += 1;
         } else {
-            if run >= 5 { p += 3 + (run - 5); }
+            if run >= 5 {
+                p += 3 + (run - 5);
+            }
             run = 1;
         }
     }
-    if run >= 5 { p += 3 + (run - 5); }
+    if run >= 5 {
+        p += 3 + (run - 5);
+    }
     p
 }
 
@@ -713,11 +788,18 @@ fn finder_pattern_count_row(n: usize, y: usize, m: impl Fn(usize, usize) -> bool
         // Pattern: dark light dark-dark-dark light dark, i.e.
         // [x] dark, [x+1] light, [x+2..x+4] dark, [x+5] light, [x+6] dark
         // with surrounding (x-1 and x+7) light if they exist.
-        if !m(x, y) || m(x+1, y) || !m(x+2,y) || !m(x+3,y) || !m(x+4,y) || m(x+5,y) || !m(x+6,y) {
+        if !m(x, y)
+            || m(x + 1, y)
+            || !m(x + 2, y)
+            || !m(x + 3, y)
+            || !m(x + 4, y)
+            || m(x + 5, y)
+            || !m(x + 6, y)
+        {
             continue;
         }
-        let left_ok = x == 0 || !m(x-1, y);
-        let right_ok = x+7 >= n || !m(x+7, y);
+        let left_ok = x == 0 || !m(x - 1, y);
+        let right_ok = x + 7 >= n || !m(x + 7, y);
         if left_ok && right_ok {
             count += 1;
         }
@@ -728,11 +810,18 @@ fn finder_pattern_count_row(n: usize, y: usize, m: impl Fn(usize, usize) -> bool
 fn finder_pattern_count_col(n: usize, x: usize, m: impl Fn(usize, usize) -> bool) -> u32 {
     let mut count: u32 = 0;
     for y in 0..n.saturating_sub(7) {
-        if !m(x, y) || m(x, y+1) || !m(x, y+2) || !m(x, y+3) || !m(x, y+4) || m(x, y+5) || !m(x, y+6) {
+        if !m(x, y)
+            || m(x, y + 1)
+            || !m(x, y + 2)
+            || !m(x, y + 3)
+            || !m(x, y + 4)
+            || m(x, y + 5)
+            || !m(x, y + 6)
+        {
             continue;
         }
-        let top_ok = y == 0 || !m(x, y-1);
-        let bottom_ok = y+7 >= n || !m(x, y+7);
+        let top_ok = y == 0 || !m(x, y - 1);
+        let bottom_ok = y + 7 >= n || !m(x, y + 7);
         if top_ok && bottom_ok {
             count += 1;
         }

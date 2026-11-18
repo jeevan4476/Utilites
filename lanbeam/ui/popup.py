@@ -22,7 +22,10 @@ import urllib.request
 from typing import Optional
 
 try:
-    from gi.repository import Gtk, Gdk, GLib
+    import gi
+
+    gi.require_version("Gtk", "4.0")
+    from gi.repository import Gtk, Gdk, GLib, GdkPixbuf
 except ImportError as exc:  # pragma: no cover - GTK not installed
     raise SystemExit(
         "lanbeam popup requires PyGObject (GTK 4). Install python3-gi and gir1.2-gtk-4.0"
@@ -32,12 +35,19 @@ POLL_INTERVAL_MS = 1000
 
 
 class PopupWindow(Gtk.ApplicationWindow):
+    @staticmethod
+    def normalize_base_url(url: str, token: str) -> str:
+        base = url.rstrip("/")
+        suffix = f"/{token}"
+        return base[: -len(suffix)].rstrip("/") if base.endswith(suffix) else base
+
     def __init__(self, application: Gtk.Application, token: str, url: str, port: int):
         super().__init__(application=application, title="lanbeam")
         self.token = token
-        self.base_url = url.rstrip("/")
+        self.base_url = self.normalize_base_url(url, token)
+        self.session_url = f"{self.base_url}/{token}"
         self.port = port
-        self.status_url = f"{self.base_url}/{token}/status"
+        self.status_url = f"{self.session_url}/status"
 
         self.set_default_size(420, 560)
         self.set_resizable(True)
@@ -58,7 +68,7 @@ class PopupWindow(Gtk.ApplicationWindow):
         box.append(self.qr_picture)
 
         # Session URL label.
-        self.url_label = Gtk.Label(label=url)
+        self.url_label = Gtk.Label(label=self.session_url)
         self.url_label.set_wrap(True)
         self.url_label.set_justify(Gtk.Justification.CENTER)
         self.url_label.add_css_class("url-label")
@@ -71,7 +81,7 @@ class PopupWindow(Gtk.ApplicationWindow):
         box.append(self.copy_btn)
 
         # Transfer status label.
-        self.status_label = Gtk.Label(label="Waiting for activity…")
+        self.status_label = Gtk.Label(label="Waiting for activity\u2026")
         self.status_label.set_wrap(True)
         self.status_label.set_justify(Gtk.Justification.CENTER)
         self.status_label.add_css_class("status-label")
@@ -97,16 +107,17 @@ class PopupWindow(Gtk.ApplicationWindow):
         controller.connect("key-pressed", self.on_key_pressed)
         self.add_controller(controller)
 
-        # Kick off polling.
+        # Kick off polling and fetch QR.
         GLib.timeout_add(POLL_INTERVAL_MS, self.poll_status)
         self.poll_status()
+        self.fetch_qr()
 
     # ------------------------------------------------------------------ #
     # Actions
     # ------------------------------------------------------------------ #
     def on_copy_link(self, _button: Gtk.Button) -> None:
         clipboard = self.get_clipboard()
-        clipboard.set(self.base_url + "/" + self.token)
+        clipboard.set(self.session_url)
 
     def on_open_downloads(self, _button: Gtk.Button) -> None:
         import subprocess
@@ -119,7 +130,7 @@ class PopupWindow(Gtk.ApplicationWindow):
     def on_stop(self, _button: Gtk.Button) -> None:
         try:
             req = urllib.request.Request(
-                f"{self.base_url}/{self.token}/stop",
+                f"{self.session_url}/stop",
                 data=b"",
                 method="POST",
             )
@@ -135,6 +146,33 @@ class PopupWindow(Gtk.ApplicationWindow):
             self.on_stop(None)
             return True
         return False
+
+    # ------------------------------------------------------------------ #
+    # QR fetching
+    # ------------------------------------------------------------------ #
+    def fetch_qr(self) -> None:
+        """Fetch QR SVG from server and load it into qr_picture."""
+        qr_url = f"{self.session_url}/qr.svg"
+        try:
+            with urllib.request.urlopen(qr_url, timeout=3) as resp:
+                svg_data = resp.read().decode("utf-8")
+            GLib.idle_add(self._load_qr_svg, svg_data)
+        except Exception:
+            # If fetch fails, leave placeholder
+            pass
+
+    def _load_qr_svg(self, svg_data: str) -> bool:
+        """Load SVG data into qr_picture via GdkPixbuf."""
+        try:
+            loader = GdkPixbuf.PixbufLoader.new_with_type("svg")
+            loader.write(svg_data.encode("utf-8"))
+            loader.close()
+            pixbuf = loader.get_pixbuf()
+            if pixbuf:
+                self.qr_picture.set_pixbuf(pixbuf)
+        except Exception:
+            pass
+        return False  # one-shot idle callback
 
     # ------------------------------------------------------------------ #
     # Polling
@@ -157,13 +195,13 @@ class PopupWindow(Gtk.ApplicationWindow):
         remaining = data.get("remaining_seconds", 0)
 
         self.status_label.set_text(
-            f"{mode.capitalize()} &bull; {dc} download(s), {ur} upload(s)"
+            f"{mode.capitalize()} \u2022 {dc} download(s), {ur} upload(s)"
         )
         if remaining > 0:
             mins = remaining // 60
             secs = remaining % 60
             self.status_label.set_text(
-                self.status_label.get_text() + f" &bull; {mins:02d}:{secs:02d} left"
+                self.status_label.get_text() + f" \u2022 {mins:02d}:{secs:02d} left"
             )
 
         if not active:

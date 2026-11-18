@@ -3,6 +3,7 @@
 #
 #   - builds the Rust binary (cargo build --release)
 #   - installs ~/.local/bin/lanbeam
+#   - installs ~/.local/share/lanbeam/ui/popup.py
 #   - registers ~/.local/share/nautilus/scripts/Share on LAN
 #
 # Run from the lanbeam project directory.
@@ -14,11 +15,12 @@ cd "$SCRIPT_DIR"
 
 BIN_DIR="$HOME/.local/bin"
 NAUTILUS_SCRIPT_DIR="$HOME/.local/share/nautilus/scripts"
-MAN_PAGE_DIR="$HOME/.local/share/man/man1"
+SHARE_DIR="$HOME/.local/share/lanbeam/ui"
 
 BINARY="target/release/lanbeam"
 DEST_BIN="$BIN_DIR/lanbeam"
 DEST_SCRIPT="$NAUTILUS_SCRIPT_DIR/Share on LAN"
+DEST_POPUP="$SHARE_DIR/popup.py"
 
 echo "[lanbeam] building release binary..."
 cargo build --release --manifest-path "$SCRIPT_DIR/Cargo.toml"
@@ -26,6 +28,10 @@ cargo build --release --manifest-path "$SCRIPT_DIR/Cargo.toml"
 echo "[lanbeam] installing binary to $DEST_BIN"
 mkdir -p "$BIN_DIR"
 install -m 0755 "$BINARY" "$DEST_BIN"
+
+echo "[lanbeam] installing popup to $DEST_POPUP"
+mkdir -p "$SHARE_DIR"
+install -m 0755 "$SCRIPT_DIR/ui/popup.py" "$DEST_POPUP"
 
 echo "[lanbeam] registering Nautilus script at $DEST_SCRIPT"
 mkdir -p "$NAUTILUS_SCRIPT_DIR"

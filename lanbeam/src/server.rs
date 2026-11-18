@@ -2,44 +2,19 @@
 //!
 //! Implements `ServerSession` over `std::net::TcpListener` serving the lanbeam
 //! transfer app on `GET /<token>` with file download, upload, text, and QR
-//! endpoints. This is the skeleton; endpoint bodies are filled in below.
+//! endpoints.
 
-use std::fs::{self, OpenOptions};
-use std::io::{self, Read, Seek, Write};
+use std::io::{self, Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
+#[cfg(not(test))]
 use std::process::Command;
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex, MutexGuard};
+use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 
 use crate::qr::QrCode;
 use crate::web_assets::WEB_ASSETS;
-use crate::zip::{write_zip_files, ZipFileEntry};
-
-/// Uploads are written in 64 KiB chunks.
-const UPLOAD_CHUNK_SIZE: usize = 64 * 1024;
-/// Maximum HTTP request header size (16 KiB).
-const MAX_HEADER_BYTES: usize = 16 * 1024;
-/// Maximum JSON body size accepted on `/text` (1 MiB).
-const MAX_TEXT_BODY_BYTES: usize = 1024 * 1024;
-/// Maximum filename length leaving room for `.` and `.lanbeam.part` inside 255 bytes.
-const MAX_UPLOAD_FILENAME_BYTES: usize = 240;
-
-static PART_SEQ: AtomicU64 = AtomicU64::new(0);
-
-fn lock_state(state: &Arc<Mutex<SessionState>>) -> MutexGuard<'_, SessionState> {
-    state.lock().unwrap_or_else(|e| e.into_inner())
-}
-
-fn spawn_detached(mut cmd: Command) {
-    if let Ok(mut child) = cmd.spawn() {
-        thread::spawn(move || {
-            let _ = child.wait();
-        });
-    }
-}
 
 /// Shared session state.
 #[derive(Debug, Clone)]
@@ -52,10 +27,21 @@ pub struct SessionState {
     pub shared_text: Option<String>,
     pub remaining_seconds: u64,
     pub active: bool,
+    // Additional fields for Half 1 & Half 2
+    pub shared_paths: Vec<PathBuf>,
+    pub zip_roots: Vec<PathBuf>,
+    pub once: bool,
+    pub max_downloads: Option<u32>,
+    pub dest_dir: PathBuf,
+    pub max_uploads: Option<u32>,
+    pub timeout_secs: Option<u64>,
+    pub started_at: Instant,
+    pub last_activity: Instant,
 }
 
 impl Default for SessionState {
     fn default() -> Self {
+        let now = Instant::now();
         Self {
             mode: "send".to_string(),
             url: String::new(),
@@ -65,6 +51,15 @@ impl Default for SessionState {
             shared_text: None,
             remaining_seconds: 0,
             active: true,
+            shared_paths: Vec::new(),
+            zip_roots: Vec::new(),
+            once: false,
+            max_downloads: None,
+            dest_dir: PathBuf::new(),
+            max_uploads: None,
+            timeout_secs: None,
+            started_at: now,
+            last_activity: now,
         }
     }
 }
@@ -75,98 +70,17 @@ pub struct ServerSession {
     token: String,
     state: Arc<Mutex<SessionState>>,
     port: u16,
-    dest: PathBuf,
-    /// Files/directories being shared (for send mode).
-    share_paths: Vec<PathBuf>,
-    /// Stop after first transfer completes (--once).
-    once: bool,
-    /// Maximum number of downloads before stopping (--max-downloads).
-    max_downloads: Option<u32>,
-    /// Maximum number of uploads before stopping (--max-uploads).
-    max_uploads: Option<u32>,
-    /// Inactivity timeout in seconds (--timeout).
-    timeout: Option<u64>,
 }
 
 impl ServerSession {
     /// Create a new session bound to `listener` on `port` serving `token`.
-    /// Uploads are stored in `~/Downloads` (or the current directory when the
-    /// home directory is unavailable) unless overridden with `with_dest`.
     pub fn new(listener: TcpListener, port: u16, token: &str) -> io::Result<Self> {
         Ok(Self {
             listener,
             token: token.to_string(),
             state: Arc::new(Mutex::new(SessionState::default())),
             port,
-            dest: default_upload_dir(),
-            share_paths: Vec::new(),
-            once: false,
-            max_downloads: None,
-            max_uploads: None,
-            timeout: None,
         })
-    }
-
-    /// Set the session mode reported by `/status` (`"send"`, `"receive"`, `"text"`).
-    pub fn with_mode(self, mode: &str) -> Self {
-        lock_state(&self.state).mode = mode.to_string();
-        self
-    }
-
-    /// Set the full session URL reported by `/status` and encoded in `/qr.svg`.
-    pub fn with_url(self, url: &str) -> Self {
-        lock_state(&self.state).url = url.to_string();
-        self
-    }
-
-    /// Set initial shared text reported by `/status`.
-    pub fn with_shared_text(self, text: Option<String>) -> Self {
-        lock_state(&self.state).shared_text = text;
-        self
-    }
-
-    /// Override the directory received uploads are stored in.
-    pub fn with_dest(mut self, dest: PathBuf) -> Self {
-        self.dest = dest;
-        self
-    }
-
-    /// Set the files/directories being shared (for send mode).
-    pub fn with_share_paths(mut self, paths: Vec<PathBuf>) -> Self {
-        let file_names: Vec<String> = paths
-            .iter()
-            .filter_map(|p| p.file_name().and_then(|n| n.to_str()).map(|s| s.to_string()))
-            .collect();
-        lock_state(&self.state).files = file_names;
-        self.share_paths = paths;
-        self
-    }
-
-    /// Enable --once: stop after first transfer completes.
-    pub fn with_once(mut self, once: bool) -> Self {
-        self.once = once;
-        self
-    }
-
-    /// Set --max-downloads: stop after N downloads complete.
-    pub fn with_max_downloads(mut self, max_downloads: Option<u32>) -> Self {
-        self.max_downloads = max_downloads;
-        self
-    }
-
-    /// Set --max-uploads: stop after N uploads complete.
-    pub fn with_max_uploads(mut self, max_uploads: Option<u32>) -> Self {
-        self.max_uploads = max_uploads;
-        self
-    }
-
-    /// Set --timeout: shut down after N seconds of inactivity.
-    pub fn with_timeout(mut self, timeout: Option<u64>) -> Self {
-        if let Some(secs) = timeout {
-            lock_state(&self.state).remaining_seconds = secs;
-        }
-        self.timeout = timeout;
-        self
     }
 
     /// The TCP port the listener is bound to.
@@ -179,81 +93,159 @@ impl ServerSession {
         &self.token
     }
 
-    /// Run the listener loop, handling each connection on its own thread until
-    /// `stop()`, inactivity timeout, or transfer limit deactivates the session,
-    /// then join all in-flight connection threads before returning.
-    pub fn run(self) -> io::Result<()> {
-        self.listener.set_nonblocking(true)?;
-        let state = self.state.clone();
-        let token = self.token.clone();
-        let dest = self.dest.clone();
-        let share_paths = self.share_paths.clone();
-        let once = self.once;
-        let max_downloads = self.max_downloads;
-        let max_uploads = self.max_uploads;
-        let timeout = self.timeout;
-        let last_activity = Arc::new(Mutex::new(Instant::now()));
-        let mut handles: Vec<thread::JoinHandle<()>> = Vec::new();
-
-        loop {
-            match self.listener.accept() {
-                Ok((stream, _addr)) => {
-                    *last_activity.lock().unwrap_or_else(|e| e.into_inner()) = Instant::now();
-                    handles.retain(|h| !h.is_finished());
-                    let state = state.clone();
-                    let token = token.clone();
-                    let dest = dest.clone();
-                    let share_paths = share_paths.clone();
-                    let last_activity = last_activity.clone();
-                    handles.push(thread::spawn(move || {
-                        if let Err(e) = handle_connection(
-                            stream,
-                            &token,
-                            &state,
-                            &dest,
-                            &share_paths,
-                            once,
-                            max_downloads,
-                            max_uploads,
-                            &last_activity,
-                        ) {
-                            eprintln!("lanbeam: connection error: {e}");
-                        }
-                    }));
-                }
-                Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
-                    let active = if let Some(secs) = timeout {
-                        let elapsed = last_activity
-                            .lock()
-                            .unwrap_or_else(|e| e.into_inner())
-                            .elapsed()
-                            .as_secs();
-                        let rem = secs.saturating_sub(elapsed);
-                        let mut st = lock_state(&self.state);
-                        st.remaining_seconds = rem;
-                        if elapsed >= secs {
-                            st.active = false;
-                        }
-                        st.active
-                    } else {
-                        lock_state(&self.state).active
-                    };
-                    if !active {
-                        break;
+    /// Configure for send mode (file sharing).
+    pub fn configure_send(
+        &self,
+        paths: Vec<PathBuf>,
+        once: bool,
+        max_downloads: Option<u32>,
+        timeout_secs: Option<u64>,
+        url: String,
+    ) {
+        let mut expanded_paths = Vec::new();
+        let mut file_names = Vec::new();
+        for p in &paths {
+            if p.is_dir() {
+                let mut collected = Vec::new();
+                if collect_files(p, p, &mut collected).is_ok() {
+                    collected.sort_by(|a, b| a.0.cmp(&b.0));
+                    for (rel, file_path) in collected {
+                        // Use relative path with forward slashes for file_names
+                        let rel_forward = rel.replace('\\', "/");
+                        file_names.push(rel_forward);
+                        expanded_paths.push(file_path);
                     }
-                    thread::sleep(Duration::from_millis(100));
                 }
-                Err(e) => {
-                    for handle in handles {
-                        let _ = handle.join();
-                    }
-                    return Err(e);
+            } else {
+                if let Some(name) = p.file_name().and_then(|n| n.to_str()) {
+                    file_names.push(name.to_string());
                 }
+                expanded_paths.push(p.clone());
             }
         }
 
-        for handle in handles {
-            let _ = handle.join();
+        let now = Instant::now();
+        let mut st = lock_state(&self.state);
+        st.mode = "send".to_string();
+        st.zip_roots = paths;
+        st.files = file_names;
+        st.shared_paths = expanded_paths;
+        st.once = once;
+        st.max_downloads = max_downloads;
+        st.timeout_secs = timeout_secs;
+        st.remaining_seconds = timeout_secs.unwrap_or(0);
+        st.started_at = now;
+        st.last_activity = now;
+        st.url = url;
+    }
+
+    /// Configure for receive mode (file upload).
+    pub fn configure_receive(
+        &self,
+        dest_dir: PathBuf,
+        max_uploads: Option<u32>,
+        timeout_secs: Option<u64>,
+        url: String,
+    ) {
+        let now = Instant::now();
+        let mut st = lock_state(&self.state);
+        st.mode = "receive".to_string();
+        st.dest_dir = dest_dir;
+        st.max_uploads = max_uploads;
+        st.timeout_secs = timeout_secs;
+        st.remaining_seconds = timeout_secs.unwrap_or(0);
+        st.started_at = now;
+        st.last_activity = now;
+        st.url = url;
+    }
+
+    /// Configure for text mode.
+    pub fn configure_text(
+        &self,
+        shared_text: Option<String>,
+        once: bool,
+        timeout_secs: Option<u64>,
+        url: String,
+    ) {
+        let now = Instant::now();
+        let mut st = lock_state(&self.state);
+        st.mode = "text".to_string();
+        st.shared_text = shared_text;
+        st.once = once;
+        st.timeout_secs = timeout_secs;
+        st.remaining_seconds = timeout_secs.unwrap_or(0);
+        st.started_at = now;
+        st.last_activity = now;
+        st.url = url;
+    }
+
+    /// Run the listener loop, handling each connection on its own thread until
+    /// `stop()` is called or the session is deactivated.
+    pub fn run(self) -> io::Result<()> {
+        const MAX_ACTIVE_WORKERS: usize = 64;
+        self.listener.set_nonblocking(true)?;
+        let mut workers: Vec<thread::JoinHandle<()>> = Vec::new();
+
+        loop {
+            // Reap finished worker threads periodically
+            let mut i = 0;
+            while i < workers.len() {
+                if workers[i].is_finished() {
+                    let handle = workers.swap_remove(i);
+                    let _ = handle.join();
+                } else {
+                    i += 1;
+                }
+            }
+
+            if workers.len() >= MAX_ACTIVE_WORKERS {
+                if !lock_state(&self.state).active {
+                    break;
+                }
+                thread::sleep(Duration::from_millis(5));
+                continue;
+            }
+
+            match self.listener.accept() {
+                Ok((stream, _addr)) => {
+                    let state = self.state.clone();
+                    let token = self.token.clone();
+                    let handle = thread::spawn(move || {
+                        if let Err(e) = handle_connection(stream, &token, &state) {
+                            eprintln!("lanbeam: connection error: {e}");
+                        }
+                    });
+                    workers.push(handle);
+                }
+                Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
+                    let (active, timeout_expired) = {
+                        let mut st = lock_state(&self.state);
+                        if let Some(timeout) = st.timeout_secs {
+                            let elapsed = st.last_activity.elapsed().as_secs();
+                            if elapsed >= timeout {
+                                st.active = false;
+                                st.remaining_seconds = 0;
+                                (false, true)
+                            } else {
+                                st.remaining_seconds = timeout.saturating_sub(elapsed);
+                                (st.active, false)
+                            }
+                        } else {
+                            (st.active, false)
+                        }
+                    };
+                    if !active || timeout_expired {
+                        break;
+                    }
+                    thread::sleep(Duration::from_millis(25));
+                }
+                Err(e) => return Err(e),
+            }
+        }
+
+        // Join all remaining worker threads
+        for w in workers {
+            let _ = w.join();
         }
         Ok(())
     }
@@ -264,125 +256,252 @@ impl ServerSession {
     }
 }
 
-/// Read HTTP headers up to `\r\n\r\n` (capped at `MAX_HEADER_BYTES`), returning
-/// the raw header bytes and any trailing body bytes already read.
-fn read_http_head(stream: &mut TcpStream) -> io::Result<Option<(Vec<u8>, Vec<u8>)>> {
-    let mut buf = Vec::with_capacity(4096);
-    let mut tmp = [0u8; 4096];
-    loop {
-        if let Some(pos) = buf.windows(4).position(|w| w == b"\r\n\r\n") {
-            let header_end = pos + 4;
-            let body = buf[header_end..].to_vec();
-            buf.truncate(header_end);
-            return Ok(Some((buf, body)));
-        }
-        if buf.len() >= MAX_HEADER_BYTES {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                "request headers exceed limit",
-            ));
-        }
-        let n = stream.read(&mut tmp)?;
-        if n == 0 {
-            if buf.is_empty() {
-                return Ok(None);
-            }
-            return Err(io::Error::new(
-                io::ErrorKind::UnexpectedEof,
-                "incomplete request headers",
-            ));
-        }
-        buf.extend_from_slice(&tmp[..n]);
-    }
+/// Poison-safe lock helper.
+fn lock_state(state: &Mutex<SessionState>) -> std::sync::MutexGuard<'_, SessionState> {
+    state.lock().unwrap_or_else(|e| e.into_inner())
 }
 
-/// Handle a single HTTP connection.
-#[allow(clippy::too_many_arguments)]
+/// Update last_activity timestamp on any transfer activity.
+fn touch_activity(state: &Arc<Mutex<SessionState>>) {
+    let mut st = lock_state(state);
+    st.last_activity = Instant::now();
+}
+
+/// Handle a single HTTP connection with raw-byte header reading and strict token routing.
 fn handle_connection(
     mut stream: TcpStream,
     token: &str,
     state: &Arc<Mutex<SessionState>>,
-    dest: &Path,
-    share_paths: &[PathBuf],
-    once: bool,
-    max_downloads: Option<u32>,
-    max_uploads: Option<u32>,
-    last_activity: &Arc<Mutex<Instant>>,
 ) -> io::Result<()> {
-    stream.set_nonblocking(false)?;
-    let _ = stream.set_read_timeout(Some(Duration::from_secs(30)));
-    let _ = stream.set_write_timeout(Some(Duration::from_secs(30)));
+    // Set timeouts
+    stream.set_read_timeout(Some(Duration::from_secs(10)))?;
+    stream.set_write_timeout(Some(Duration::from_secs(30)))?;
 
-    let (head_bytes, body_bytes) = match read_http_head(&mut stream) {
-        Ok(Some(parts)) => parts,
-        Ok(None) => return Ok(()),
-        Err(_) => return respond(&mut stream, 400, "text/plain", b"Bad Request"),
+    // Read headers into a buffer until \r\n\r\n is found
+    let mut buf = Vec::with_capacity(4096);
+    let mut temp = [0u8; 4096];
+    let mut header_end = None;
+
+    loop {
+        match stream.read(&mut temp) {
+            Ok(0) => {
+                // EOF before headers complete
+                if header_end.is_none() {
+                    return Ok(());
+                }
+                break;
+            }
+            Ok(n) => {
+                let prev_len = buf.len();
+                buf.extend_from_slice(&temp[..n]);
+                // Check only newly arrived boundary for header terminator
+                if header_end.is_none() {
+                    let search_start = prev_len.saturating_sub(3);
+                    if let Some(pos) = buf[search_start..]
+                        .windows(4)
+                        .position(|w| w == b"\r\n\r\n")
+                    {
+                        let abs_pos = search_start + pos;
+                        if abs_pos > 16 * 1024 {
+                            return respond(
+                                &mut stream,
+                                400,
+                                "text/plain",
+                                b"Bad Request: Headers too large",
+                            );
+                        }
+                        header_end = Some(abs_pos);
+                        break;
+                    }
+                }
+                if buf.len() > 16 * 1024 && header_end.is_none() {
+                    return respond(
+                        &mut stream,
+                        400,
+                        "text/plain",
+                        b"Bad Request: Headers too large",
+                    );
+                }
+            }
+            Err(e)
+                if e.kind() == io::ErrorKind::WouldBlock || e.kind() == io::ErrorKind::TimedOut =>
+            {
+                return respond(&mut stream, 408, "text/plain", b"Request Timeout");
+            }
+            Err(e) => return Err(e),
+        }
+    }
+
+    let header_end = header_end
+        .ok_or_else(|| io::Error::new(io::ErrorKind::UnexpectedEof, "Incomplete headers"))?;
+
+    // Split headers and initial body
+    let header_bytes = &buf[..header_end];
+    let initial_body = &buf[header_end + 4..];
+
+    // Parse headers as UTF-8
+    let header_str = match std::str::from_utf8(header_bytes) {
+        Ok(s) => s,
+        Err(_) => {
+            return respond(
+                &mut stream,
+                400,
+                "text/plain",
+                b"Bad Request: Invalid UTF-8 in headers",
+            )
+        }
     };
 
-    let req = String::from_utf8_lossy(&head_bytes);
-    let content_length = req
-        .lines()
-        .find(|line| line.to_ascii_lowercase().starts_with("content-length:"))
-        .and_then(|line| line.split_once(':'))
-        .and_then(|(_, value)| value.trim().parse::<usize>().ok());
-
-    let mut lines = req.lines();
+    // Parse request line
+    let mut lines = header_str.lines();
     let request_line = lines.next().unwrap_or("");
     let parts: Vec<&str> = request_line.split_whitespace().collect();
     if parts.len() < 2 {
         return respond(&mut stream, 400, "text/plain", b"Bad Request");
     }
     let method = parts[0];
-    let path = parts[1];
-    let (route, _query) = path.split_once('?').unwrap_or((path, ""));
+    let full_path = parts[1];
 
-    // Reject any path outside /<token> (strict boundary check, including /).
+    // Split path on first '?' to get raw_path and query
+    let (raw_path, query) = match full_path.split_once('?') {
+        Some((p, q)) => (p, Some(q)),
+        None => (full_path, None),
+    };
+
+    // Strict token boundary check (NO exemption for "/")
     let expected_prefix = format!("/{}", token);
-    let token_matches = route == expected_prefix
-        || route
-            .strip_prefix(&expected_prefix)
-            .is_some_and(|rest| rest.starts_with('/'));
-    if !token_matches {
+    let is_valid_token_path = match raw_path.strip_prefix(&expected_prefix) {
+        Some("") => true,
+        Some(rest) => rest.starts_with('/'),
+        None => false,
+    };
+    if !is_valid_token_path {
         return respond(&mut stream, 403, "text/plain", b"Forbidden");
     }
 
-    *last_activity.lock().unwrap_or_else(|e| e.into_inner()) = Instant::now();
+    // Route based on raw_path and method
+    match (method, raw_path) {
+        ("GET", p) if p == &expected_prefix || p == format!("{expected_prefix}/") => {
+            serve_app(&mut stream, state, token)
+        }
+        ("GET", p) if p == format!("{expected_prefix}/qr.svg") => {
+            serve_qr(&mut stream, state, token)
+        }
+        ("GET", p) if p == format!("{expected_prefix}/status") => {
+            serve_status(&mut stream, state, token)
+        }
+        ("GET", p) if p.starts_with(&format!("{expected_prefix}/download/")) => {
+            serve_download(&mut stream, p, state, token, header_str)
+        }
+        ("GET", p) if p == format!("{expected_prefix}/download-all.zip") => {
+            serve_download_all(&mut stream, state)
+        }
+        ("POST", p) if p == format!("{expected_prefix}/upload") => {
+            serve_upload(&mut stream, state, query, initial_body, header_str)
+        }
+        ("POST", p) if p == format!("{expected_prefix}/text") => {
+            // Read body for text endpoint - support both Content-Length and chunked encoding
+            if has_transfer_encoding(header_str)
+                && (!is_chunked_transfer(header_str) || get_content_length(header_str).is_some())
+            {
+                return respond(
+                    &mut stream,
+                    400,
+                    "text/plain",
+                    b"Bad Request: Unsupported or ambiguous Transfer-Encoding",
+                );
+            }
+            if is_chunked_transfer(header_str) {
+                // Chunked encoding path - max 64 KiB
+                let mut body = Vec::new();
+                let result =
+                    read_chunked_body(&mut stream, initial_body, state, 64 * 1024, |chunk| {
+                        touch_activity(state);
+                        body.extend_from_slice(chunk);
+                        Ok(())
+                    });
+                match result {
+                    Ok(_) => {
+                        // Validate strict UTF-8
+                        let body_str = match std::str::from_utf8(&body) {
+                            Ok(s) => s,
+                            Err(_) => {
+                                return respond(
+                                    &mut stream,
+                                    400,
+                                    "text/plain",
+                                    b"Bad Request: Invalid UTF-8 in body",
+                                )
+                            }
+                        };
+                        serve_text(&mut stream, state, body_str)
+                    }
+                    Err((status, message)) => {
+                        respond(&mut stream, status, "text/plain", message.as_bytes())
+                    }
+                }
+            } else {
+                // Content-Length path
+                let content_length = match header_str
+                    .lines()
+                    .find(|l| l.to_lowercase().starts_with("content-length:"))
+                    .and_then(|l| l.split(':').nth(1))
+                    .and_then(|v| v.trim().parse::<usize>().ok())
+                {
+                    Some(cl) => cl,
+                    None => {
+                        return respond(
+                            &mut stream,
+                            400,
+                            "text/plain",
+                            b"Bad Request: Missing Content-Length",
+                        )
+                    }
+                };
 
-    let range_header = req
-        .lines()
-        .find(|line| line.to_ascii_lowercase().starts_with("range:"))
-        .and_then(|line| line.split_once(':'))
-        .map(|(_, v)| v.trim().to_string());
+                if content_length > 64 * 1024 {
+                    return respond(
+                        &mut stream,
+                        400,
+                        "text/plain",
+                        b"Bad Request: Content-Length exceeds 64 KiB",
+                    );
+                }
 
-    match (method, route) {
-        ("GET", r) if r == expected_prefix || r == format!("{expected_prefix}/") => {
-            serve_app(&mut stream, state)
+                let mut body = initial_body[..initial_body.len().min(content_length)].to_vec();
+                while body.len() < content_length {
+                    let remaining = content_length - body.len();
+                    let chunk_cap = temp.len().min(remaining);
+                    let n = stream.read(&mut temp[..chunk_cap])?;
+                    if n == 0 {
+                        return respond(
+                            &mut stream,
+                            400,
+                            "text/plain",
+                            b"Bad Request: Premature EOF",
+                        );
+                    }
+                    touch_activity(state);
+                    body.extend_from_slice(&temp[..n]);
+                }
+
+                // Validate strict UTF-8
+                let body_str = match std::str::from_utf8(&body) {
+                    Ok(s) => s,
+                    Err(_) => {
+                        return respond(
+                            &mut stream,
+                            400,
+                            "text/plain",
+                            b"Bad Request: Invalid UTF-8 in body",
+                        )
+                    }
+                };
+
+                serve_text(&mut stream, state, body_str)
+            }
         }
-        ("GET", r) if r == format!("{expected_prefix}/qr.svg") => {
-            serve_qr(&mut stream, token, state)
-        }
-        ("GET", r) if r == format!("{expected_prefix}/status") => serve_status(&mut stream, state),
-        ("GET", r) if r.starts_with(&format!("{expected_prefix}/download/")) => {
-            serve_download(&mut stream, r, state, share_paths, once, max_downloads, range_header)
-        }
-        ("GET", r) if r == format!("{expected_prefix}/download-all.zip") => {
-            serve_download_all(&mut stream, share_paths)
-        }
-        ("POST", r) if r == format!("{expected_prefix}/upload") => serve_upload(
-            &mut stream,
-            path,
-            state,
-            dest,
-            &body_bytes,
-            content_length,
-            max_uploads,
-        ),
-        ("POST", r) if r == format!("{expected_prefix}/text") => {
-            let full_body = read_bounded_body(&mut stream, &body_bytes, content_length, MAX_TEXT_BODY_BYTES)?;
-            let body = String::from_utf8_lossy(&full_body);
-            serve_text(&mut stream, state, &body, once)
-        }
-        ("POST", r) if r == format!("{expected_prefix}/stop") => {
+        ("POST", p) if p == format!("{expected_prefix}/stop") => {
             lock_state(state).active = false;
             respond(&mut stream, 200, "text/plain", b"Stopping")
         }
@@ -390,76 +509,239 @@ fn handle_connection(
     }
 }
 
-fn read_bounded_body(
-    stream: &mut TcpStream,
-    initial: &[u8],
-    content_length: Option<usize>,
-    cap: usize,
-) -> io::Result<Vec<u8>> {
-    let target = content_length.unwrap_or(initial.len()).min(cap);
-    let mut out = Vec::with_capacity(target);
-    let take = initial.len().min(target);
-    out.extend_from_slice(&initial[..take]);
-    let mut tmp = [0u8; 4096];
-    while out.len() < target {
-        let need = (target - out.len()).min(tmp.len());
-        let n = stream.read(&mut tmp[..need])?;
-        if n == 0 {
-            break;
-        }
-        out.extend_from_slice(&tmp[..n]);
-    }
-    Ok(out)
-}
-
-/// Default upload destination: `~/Downloads`, falling back to the cwd.
-fn default_upload_dir() -> PathBuf {
-    std::env::home_dir()
-        .map(|home| home.join("Downloads"))
-        .unwrap_or_else(|| std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")))
-}
-
-fn respond(stream: &mut TcpStream, status: u16, content_type: &str, body: &[u8]) -> io::Result<()> {
-    let status_text = match status {
+fn status_reason(status: u16) -> &'static str {
+    match status {
         200 => "OK",
         206 => "Partial Content",
         400 => "Bad Request",
         403 => "Forbidden",
         404 => "Not Found",
-        411 => "Length Required",
+        408 => "Request Timeout",
+        413 => "Payload Too Large",
         416 => "Range Not Satisfiable",
         500 => "Internal Server Error",
+        503 => "Service Unavailable",
         _ => "Unknown",
-    };
-    let response = format!(
-        "HTTP/1.1 {} {}\r\nContent-Type: {}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
-        status, status_text, content_type, body.len()
-    );
-    stream.write_all(response.as_bytes())?;
-    stream.write_all(body)?;
-    Ok(())
-}
-
-fn serve_app(stream: &mut TcpStream, _state: &Arc<Mutex<SessionState>>) -> io::Result<()> {
-    // Serve the embedded TypeScript web app. The frontend polls /status on load
-    // to pick up the initial session state.
-    respond(stream, 200, "text/html; charset=utf-8", WEB_ASSETS.as_bytes())
-}
-
-fn serve_qr(stream: &mut TcpStream, token: &str, state: &Arc<Mutex<SessionState>>) -> io::Result<()> {
-    let url = lock_state(state).url.clone();
-    let payload = if url.is_empty() { token } else { url.as_str() };
-    match QrCode::encode(payload) {
-        Ok(qr) => {
-            let svg = qr.to_svg(4);
-            respond(stream, 200, "image/svg+xml", svg.as_bytes())
-        }
-        Err(_) => respond(stream, 500, "text/plain", b"QR encode failed"),
     }
 }
 
-fn serve_status(stream: &mut TcpStream, state: &Arc<Mutex<SessionState>>) -> io::Result<()> {
-    let st = lock_state(state);
+fn respond(stream: &mut TcpStream, status: u16, content_type: &str, body: &[u8]) -> io::Result<()> {
+    let response = format!(
+        "HTTP/1.1 {} {}\r\nContent-Type: {}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+        status,
+        status_reason(status),
+        content_type,
+        body.len()
+    );
+    stream.write_all(response.as_bytes())?;
+    if !body.is_empty() {
+        stream.write_all(body)?;
+    }
+    Ok(())
+}
+
+fn get_content_length(headers: &str) -> Option<usize> {
+    headers.lines().skip(1).find_map(|line| {
+        let (name, value) = line.split_once(':')?;
+        name.trim()
+            .eq_ignore_ascii_case("content-length")
+            .then(|| value.trim().parse().ok())
+            .flatten()
+    })
+}
+
+/// Check if Transfer-Encoding header indicates chunked encoding.
+fn is_chunked_transfer(headers: &str) -> bool {
+    let encodings: Vec<_> = headers
+        .lines()
+        .skip(1)
+        .filter_map(|line| line.split_once(':'))
+        .filter(|(name, _)| name.trim().eq_ignore_ascii_case("transfer-encoding"))
+        .map(|(_, value)| value.trim())
+        .collect();
+    encodings.len() == 1 && encodings[0].eq_ignore_ascii_case("chunked")
+}
+
+fn has_transfer_encoding(headers: &str) -> bool {
+    headers
+        .lines()
+        .skip(1)
+        .filter_map(|line| line.split_once(':'))
+        .any(|(name, _)| name.trim().eq_ignore_ascii_case("transfer-encoding"))
+}
+
+/// Read a chunked request body with streaming processing.
+/// Returns total bytes processed or an error with status code and message.
+fn read_chunked_body<F>(
+    stream: &mut TcpStream,
+    initial_body: &[u8],
+    state: &Arc<Mutex<SessionState>>,
+    max_bytes: u64,
+    mut on_chunk: F,
+) -> Result<u64, (u16, &'static str)>
+where
+    F: FnMut(&[u8]) -> Result<(), (u16, &'static str)>,
+{
+    const IO_CHUNK_SIZE: usize = 64 * 1024;
+    let mut buffer = Vec::with_capacity(IO_CHUNK_SIZE);
+    buffer.extend_from_slice(initial_body);
+    let mut total_bytes = 0u64;
+    let mut temp = [0u8; IO_CHUNK_SIZE];
+
+    loop {
+        let line_end = buffer.windows(2).position(|w| w == b"\r\n");
+        if line_end.is_none() {
+            if buffer.len() > 8192 {
+                return Err((400, "Bad Request: Chunk size line too long"));
+            }
+            match stream.read(&mut temp) {
+                Ok(0) => return Err((400, "Bad Request: Incomplete chunked body")),
+                Ok(n) => {
+                    touch_activity(state);
+                    buffer.extend_from_slice(&temp[..n]);
+                    continue;
+                }
+                Err(e)
+                    if e.kind() == io::ErrorKind::TimedOut
+                        || e.kind() == io::ErrorKind::WouldBlock =>
+                {
+                    return Err((400, "Bad Request: Premature EOF"));
+                }
+                Err(_) => return Err((500, "Internal Server Error: Read failed")),
+            }
+        }
+        let line_end = line_end.unwrap();
+        if line_end > 8192 {
+            return Err((400, "Bad Request: Chunk size line too long"));
+        }
+        let size_line = std::str::from_utf8(&buffer[..line_end])
+            .map_err(|_| (400, "Bad Request: Invalid chunk size encoding"))?;
+        let size_str = size_line.split(';').next().unwrap_or("").trim();
+        let chunk_size = u64::from_str_radix(size_str, 16)
+            .map_err(|_| (400, "Bad Request: Invalid chunk size"))?;
+        buffer.drain(..line_end + 2);
+
+        if chunk_size == 0 {
+            let mut trailer_bytes = 0usize;
+            loop {
+                let trailer_end = buffer.windows(2).position(|w| w == b"\r\n");
+                if trailer_end.is_none() {
+                    if buffer.len() > 8192 || trailer_bytes.saturating_add(buffer.len()) > 64 * 1024
+                    {
+                        return Err((400, "Bad Request: Chunk trailers too large"));
+                    }
+                    match stream.read(&mut temp) {
+                        Ok(0) => return Err((400, "Bad Request: Incomplete chunk trailers")),
+                        Ok(n) => {
+                            touch_activity(state);
+                            buffer.extend_from_slice(&temp[..n]);
+                            continue;
+                        }
+                        Err(e)
+                            if e.kind() == io::ErrorKind::TimedOut
+                                || e.kind() == io::ErrorKind::WouldBlock =>
+                        {
+                            return Err((400, "Bad Request: Premature EOF"));
+                        }
+                        Err(_) => return Err((500, "Internal Server Error: Read failed")),
+                    }
+                }
+                let trailer_end = trailer_end.unwrap();
+                if trailer_end == 0 {
+                    buffer.drain(..2);
+                    if !buffer.is_empty() {
+                        return Err((400, "Bad Request: Unexpected bytes after chunked body"));
+                    }
+                    return Ok(total_bytes);
+                }
+                if trailer_end > 8192 || trailer_bytes.saturating_add(trailer_end + 2) > 64 * 1024 {
+                    return Err((400, "Bad Request: Chunk trailers too large"));
+                }
+                trailer_bytes += trailer_end + 2;
+                buffer.drain(..trailer_end + 2);
+            }
+        }
+
+        let new_total = total_bytes
+            .checked_add(chunk_size)
+            .ok_or((413, "Payload Too Large"))?;
+        if new_total > max_bytes {
+            return Err((413, "Payload Too Large"));
+        }
+        let mut remaining = usize::try_from(chunk_size).map_err(|_| (413, "Payload Too Large"))?;
+        while remaining > 0 {
+            if !buffer.is_empty() {
+                let count = remaining.min(buffer.len());
+                on_chunk(&buffer[..count]).map_err(|e| e)?;
+                buffer.drain(..count);
+                remaining -= count;
+                continue;
+            }
+            let count = remaining.min(temp.len());
+            match stream.read(&mut temp[..count]) {
+                Ok(0) => return Err((400, "Bad Request: Premature EOF")),
+                Ok(n) => {
+                    touch_activity(state);
+                    on_chunk(&temp[..n]).map_err(|e| e)?;
+                    remaining -= n;
+                }
+                Err(e)
+                    if e.kind() == io::ErrorKind::TimedOut
+                        || e.kind() == io::ErrorKind::WouldBlock =>
+                {
+                    return Err((400, "Bad Request: Premature EOF"));
+                }
+                Err(_) => return Err((500, "Internal Server Error: Read failed")),
+            }
+        }
+        total_bytes = new_total;
+
+        while buffer.len() < 2 {
+            let missing = 2 - buffer.len();
+            match stream.read(&mut temp[..missing]) {
+                Ok(0) => return Err((400, "Bad Request: Premature EOF")),
+                Ok(n) => {
+                    touch_activity(state);
+                    buffer.extend_from_slice(&temp[..n]);
+                }
+                Err(e)
+                    if e.kind() == io::ErrorKind::TimedOut
+                        || e.kind() == io::ErrorKind::WouldBlock =>
+                {
+                    return Err((400, "Bad Request: Premature EOF"));
+                }
+                Err(_) => return Err((500, "Internal Server Error: Read failed")),
+            }
+        }
+        if &buffer[..2] != b"\r\n" {
+            return Err((400, "Bad Request: Missing CRLF after chunk data"));
+        }
+        buffer.drain(..2);
+    }
+}
+
+fn respond_headers(
+    stream: &mut TcpStream,
+    status: u16,
+    headers: &[(&str, &str)],
+    body: Option<&[u8]>,
+) -> io::Result<()> {
+    let mut response = format!("HTTP/1.1 {} {}\r\n", status, status_reason(status));
+    for (k, v) in headers {
+        response.push_str(k);
+        response.push_str(": ");
+        response.push_str(v);
+        response.push_str("\r\n");
+    }
+    response.push_str("\r\n");
+    stream.write_all(response.as_bytes())?;
+    if let Some(b) = body {
+        stream.write_all(b)?;
+    }
+    Ok(())
+}
+
+fn serialize_session_json(st: &SessionState, token: Option<&str>) -> String {
     let files_json = st
         .files
         .iter()
@@ -470,8 +752,13 @@ fn serve_status(stream: &mut TcpStream, state: &Arc<Mutex<SessionState>>) -> io:
         Some(t) => format!("\"shared_text\":\"{}\"", escape_json(t)),
         None => "\"shared_text\":null".to_string(),
     };
-    let body = format!(
-        "{{\"mode\":\"{}\",\"url\":\"{}\",\"files\":[{}],\"downloads_completed\":{},\"uploads_received\":{},{},\"remaining_seconds\":{},\"active\":{}}}",
+    let token_prefix = match token {
+        Some(t) => format!("\"token\":\"{}\",", escape_json(t)),
+        None => String::new(),
+    };
+    format!(
+        "{{{}\"mode\":\"{}\",\"url\":\"{}\",\"files\":[{}],\"downloads_completed\":{},\"uploads_received\":{},{},\"remaining_seconds\":{},\"active\":{}}}",
+        token_prefix,
         escape_json(&st.mode),
         escape_json(&st.url),
         files_json,
@@ -480,676 +767,1077 @@ fn serve_status(stream: &mut TcpStream, state: &Arc<Mutex<SessionState>>) -> io:
         shared_text_json,
         st.remaining_seconds,
         st.active
+    )
+}
+
+fn serve_app(
+    stream: &mut TcpStream,
+    state: &Arc<Mutex<SessionState>>,
+    token: &str,
+) -> io::Result<()> {
+    let status_json = {
+        let st = lock_state(state);
+        serialize_session_json(&st, Some(token))
+    }
+    .replace('<', "\\u003c");
+    let injection = format!(
+        "<script>window.__LANBEAM_INITIAL_STATE__ = {};</script>",
+        status_json
     );
+    let total_len = (WEB_ASSETS.len() + injection.len()).to_string();
+    respond_headers(
+        stream,
+        200,
+        &[
+            ("Content-Type", "text/html; charset=utf-8"),
+            ("Content-Length", &total_len),
+            ("Connection", "close"),
+        ],
+        None,
+    )?;
+
+    let assets = WEB_ASSETS.as_bytes();
+    if let Some(pos) = WEB_ASSETS
+        .rfind("</head>")
+        .or_else(|| WEB_ASSETS.find("</body>"))
+    {
+        stream.write_all(&assets[..pos])?;
+        stream.write_all(injection.as_bytes())?;
+        stream.write_all(&assets[pos..])?;
+    } else {
+        stream.write_all(assets)?;
+        stream.write_all(injection.as_bytes())?;
+    }
+    Ok(())
+}
+
+fn serve_qr(
+    stream: &mut TcpStream,
+    state: &Arc<Mutex<SessionState>>,
+    token: &str,
+) -> io::Result<()> {
+    let url = {
+        let st = lock_state(state);
+        if st.url.is_empty() {
+            token.to_string()
+        } else {
+            st.url.clone()
+        }
+    };
+    let qr = match QrCode::encode(&url) {
+        Ok(q) => q,
+        Err(_) => {
+            return respond(
+                stream,
+                500,
+                "text/plain",
+                b"Internal Server Error: QR encode failed",
+            )
+        }
+    };
+    let svg = qr.to_svg(4);
+    respond(stream, 200, "image/svg+xml", svg.as_bytes())
+}
+
+fn serve_status(
+    stream: &mut TcpStream,
+    state: &Arc<Mutex<SessionState>>,
+    token: &str,
+) -> io::Result<()> {
+    let body = {
+        let st = lock_state(state);
+        serialize_session_json(&st, Some(token))
+    };
     respond(stream, 200, "application/json", body.as_bytes())
 }
 
-/// Escape special and control characters for JSON string values.
 fn escape_json(s: &str) -> String {
-    let mut out = String::with_capacity(s.len());
+    let mut escaped = String::with_capacity(s.len());
     for c in s.chars() {
         match c {
-            '\\' => out.push_str("\\\\"),
-            '"' => out.push_str("\\\""),
-            '\n' => out.push_str("\\n"),
-            '\r' => out.push_str("\\r"),
-            '\t' => out.push_str("\\t"),
-            c if c.is_control() => out.push_str(&format!("\\u{:04x}", c as u32)),
-            c => out.push(c),
+            '"' => escaped.push_str("\\\""),
+            '\\' => escaped.push_str("\\\\"),
+            '\n' => escaped.push_str("\\n"),
+            '\r' => escaped.push_str("\\r"),
+            '\t' => escaped.push_str("\\t"),
+            c if (c as u32) < 0x20 => escaped.push_str(&format!("\\u{:04x}", c as u32)),
+            c => escaped.push(c),
         }
     }
-    out
+    escaped
 }
 
-/// Download chunk size: 64 KiB.
-const DOWNLOAD_CHUNK_SIZE: usize = 64 * 1024;
+/// Percent-decode a path component from bytes, returning Result<&str, ()>.
+/// Validates UTF-8 and rejects null bytes and control characters.
+fn percent_decode(s: &str) -> Result<String, ()> {
+    let bytes = s.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        let b = bytes[i];
+        if b == b'%' {
+            if i + 2 >= bytes.len() {
+                return Err(()); // incomplete
+            }
+            let hi = bytes[i + 1];
+            let lo = bytes[i + 2];
+            let hi_val = match hi {
+                b'0'..=b'9' => hi - b'0',
+                b'A'..=b'F' => hi - b'A' + 10,
+                b'a'..=b'f' => hi - b'a' + 10,
+                _ => return Err(()), // invalid hex
+            };
+            let lo_val = match lo {
+                b'0'..=b'9' => lo - b'0',
+                b'A'..=b'F' => lo - b'A' + 10,
+                b'a'..=b'f' => lo - b'a' + 10,
+                _ => return Err(()), // invalid hex
+            };
+            let byte = (hi_val << 4) | lo_val;
+            if byte == 0 || byte.is_ascii_control() {
+                return Err(()); // null or control
+            }
+            out.push(byte);
+            i += 3;
+        } else if b == b'\\' {
+            return Err(()); // backslash
+        } else {
+            out.push(b);
+            i += 1;
+        }
+    }
+    // Validate UTF-8
+    let s = std::str::from_utf8(&out).map_err(|_| ())?;
+    Ok(s.to_string())
+}
 
-/// Stream a single file for download with HTTP Range support.
-///
-/// Path format: `/<token>/download/<index>/<name>` where `<index>` is the
-/// index into `share_paths`.
+/// Collect all regular files under `root` recursively, skipping symlinks.
+fn collect_files(root: &Path, base: &Path, out: &mut Vec<(String, PathBuf)>) -> io::Result<()> {
+    for entry in std::fs::read_dir(root)? {
+        let entry = entry?;
+        let path = entry.path();
+        let meta = std::fs::symlink_metadata(&path)?;
+        if meta.file_type().is_symlink() {
+            continue; // Skip all symlinks
+        }
+        if meta.is_dir() {
+            collect_files(&path, base, out)?;
+        } else if meta.is_file() {
+            let rel = path
+                .strip_prefix(base)
+                .unwrap()
+                .to_string_lossy()
+                .to_string();
+            out.push((rel, path));
+        }
+    }
+    Ok(())
+}
+
+/// Chunked transfer encoding writer with a pre-allocated frame per flush.
+struct ChunkedWriter<'a> {
+    stream: &'a mut TcpStream,
+    buf: Vec<u8>,
+    chunk_size: usize,
+    frame: Vec<u8>, // pre-allocated for single write_all per flush
+}
+
+impl<'a> ChunkedWriter<'a> {
+    fn new(stream: &'a mut TcpStream, chunk_size: usize) -> Self {
+        Self {
+            stream,
+            buf: Vec::with_capacity(chunk_size),
+            chunk_size,
+            frame: Vec::with_capacity(chunk_size + 32),
+        }
+    }
+
+    fn write_chunk(&mut self, data: &[u8]) -> io::Result<()> {
+        if data.is_empty() {
+            return Ok(());
+        }
+        let mut remaining = data;
+        while !remaining.is_empty() {
+            let space = self.chunk_size - self.buf.len();
+            let take = space.min(remaining.len());
+            self.buf.extend_from_slice(&remaining[..take]);
+            remaining = &remaining[take..];
+            if self.buf.len() == self.chunk_size {
+                self.flush_chunk()?;
+            }
+        }
+        Ok(())
+    }
+
+    fn flush_chunk(&mut self) -> io::Result<()> {
+        if self.buf.is_empty() {
+            return Ok(());
+        }
+        let chunk_len = self.buf.len();
+        self.frame.clear();
+        // Write chunk size in hex + CRLF
+        write!(self.frame, "{:x}\r\n", chunk_len)?;
+        // Append chunk data
+        self.frame.extend_from_slice(&self.buf);
+        // Append CRLF
+        self.frame.extend_from_slice(b"\r\n");
+        // Keep each chunk in one contiguous write_all call.
+        self.stream.write_all(&self.frame)?;
+        self.buf.clear();
+        Ok(())
+    }
+
+    fn finish(mut self) -> io::Result<()> {
+        self.flush_chunk()?;
+        self.stream.write_all(b"0\r\n\r\n")?;
+        Ok(())
+    }
+}
+
+impl<'a> Write for ChunkedWriter<'a> {
+    fn write(&mut self, data: &[u8]) -> io::Result<usize> {
+        self.write_chunk(data)?;
+        Ok(data.len())
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        self.flush_chunk()
+    }
+}
+
+struct ActivityWriter<'a, 's> {
+    writer: &'a mut ChunkedWriter<'s>,
+    state: &'a Arc<Mutex<SessionState>>,
+}
+
+impl Write for ActivityWriter<'_, '_> {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        touch_activity(self.state);
+        self.writer.write(buf)
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        touch_activity(self.state);
+        self.writer.flush()
+    }
+}
+
 fn serve_download(
     stream: &mut TcpStream,
     path: &str,
     state: &Arc<Mutex<SessionState>>,
-    share_paths: &[PathBuf],
-    once: bool,
-    max_downloads: Option<u32>,
-    range_header: Option<String>,
+    token: &str,
+    header_str: &str,
 ) -> io::Result<()> {
-    // Parse /<token>/download/<index>/<name>
-    let prefix = "/download/";
-    let Some((_before, rest)) = path.split_once(prefix) else {
-        return respond(stream, 404, "text/plain", b"Not Found");
-    };
-    let (idx_str, _name) = match rest.split_once('/') {
-        Some((i, n)) => (i, n),
+    touch_activity(state);
+    let prefix = format!("/{}/download/", token);
+    let rest = match path.strip_prefix(&prefix) {
+        Some(r) => r,
         None => return respond(stream, 404, "text/plain", b"Not Found"),
     };
-    let idx: usize = match idx_str.parse() {
+
+    // Parse <id>/<name> where <name> may contain subdirectories
+    let (id_str, name_encoded) = match rest.split_once('/') {
+        Some(p) => p,
+        None => return respond(stream, 404, "text/plain", b"Not Found"),
+    };
+    let id: usize = match id_str.parse() {
         Ok(i) => i,
         Err(_) => return respond(stream, 404, "text/plain", b"Not Found"),
     };
 
-    // Get the file path to serve.
-    let file_path = match share_paths.get(idx) {
+    // Percent-decode name (using new function that returns Result)
+    let decoded_name = match percent_decode(name_encoded) {
+        Ok(d) => d,
+        Err(()) => {
+            return respond(
+                stream,
+                400,
+                "text/plain",
+                b"Bad Request: Invalid path encoding",
+            )
+        }
+    };
+
+    // Reject path traversal, leading slash, backslash
+    if decoded_name.contains("..") || decoded_name.starts_with('/') || decoded_name.contains('\\') {
+        return respond(stream, 403, "text/plain", b"Forbidden");
+    }
+
+    // Snapshot shared_paths under lock
+    let root_path = {
+        let st = lock_state(state);
+        st.shared_paths.get(id).cloned()
+    };
+    let root_path = match root_path {
         Some(p) => p,
         None => return respond(stream, 404, "text/plain", b"Not Found"),
     };
 
-    // Verify metadata without following symlinks and reject directories before sending headers.
-    let meta = match fs::symlink_metadata(file_path) {
+    // Symlink & root-containment checks
+    let root_meta = match std::fs::symlink_metadata(&root_path) {
         Ok(m) => m,
-        Err(e) if e.kind() == io::ErrorKind::NotFound => {
+        Err(_) => return respond(stream, 404, "text/plain", b"Not Found"),
+    };
+
+    // If root_path itself is a symlink, verify its target stays inside parent
+    if root_meta.file_type().is_symlink() {
+        let canon_root = match root_path.canonicalize() {
+            Ok(p) => p,
+            Err(_) => return respond(stream, 403, "text/plain", b"Forbidden"),
+        };
+        let parent = root_path.parent().and_then(|p| p.canonicalize().ok());
+        if let Some(parent_canon) = parent {
+            if !canon_root.starts_with(&parent_canon) {
+                return respond(stream, 403, "text/plain", b"Forbidden");
+            }
+        }
+    }
+
+    let (target_path, file_size) = if root_meta.is_dir() {
+        // Directory: join decoded_name, check candidate
+        let candidate = root_path.join(decoded_name);
+        let cand_meta = match std::fs::symlink_metadata(&candidate) {
+            Ok(m) => m,
+            Err(_) => return respond(stream, 404, "text/plain", b"Not Found"),
+        };
+        if cand_meta.file_type().is_symlink() {
+            return respond(stream, 403, "text/plain", b"Forbidden");
+        }
+        if !cand_meta.is_file() {
             return respond(stream, 404, "text/plain", b"Not Found");
         }
-        Err(e) => return Err(e),
-    };
-    if meta.file_type().is_symlink() {
-        return respond(stream, 403, "text/plain", b"Forbidden");
-    }
-    if !meta.is_file() {
+        let canon_root = match root_path.canonicalize() {
+            Ok(p) => p,
+            Err(_) => return respond(stream, 403, "text/plain", b"Forbidden"),
+        };
+        let canon_target = match candidate.canonicalize() {
+            Ok(p) => p,
+            Err(_) => return respond(stream, 403, "text/plain", b"Forbidden"),
+        };
+        if !canon_target.starts_with(&canon_root) {
+            return respond(stream, 403, "text/plain", b"Forbidden");
+        }
+        (canon_target, cand_meta.len())
+    } else if root_meta.is_file() {
+        // Regular file: decoded_name must match either the registered st.files entry
+        // (which preserves relative subdirectory paths) OR the bare file_name.
+        let registered_name = {
+            let st = lock_state(state);
+            st.files.get(id).cloned()
+        };
+        let file_basename = root_path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("")
+            .to_string();
+        let expected_rel = registered_name.as_deref().unwrap_or(file_basename.as_str());
+        if decoded_name != expected_rel && decoded_name != file_basename {
+            return respond(stream, 404, "text/plain", b"Not Found");
+        }
+        let canon_root = match root_path.canonicalize() {
+            Ok(p) => p,
+            Err(_) => return respond(stream, 403, "text/plain", b"Forbidden"),
+        };
+        (canon_root, root_meta.len())
+    } else {
         return respond(stream, 404, "text/plain", b"Not Found");
-    }
+    };
 
-    let mut file = match fs::File::open(file_path) {
+    // Parse Range header from header_str
+    let range_header = header_str
+        .lines()
+        .find(|l| l.to_lowercase().starts_with("range:"))
+        .map(|l| l["range:".len()..].trim().to_string());
+
+    // Open file
+    let mut file = match std::fs::File::open(&target_path) {
         Ok(f) => f,
-        Err(e) if e.kind() == io::ErrorKind::NotFound => {
-            return respond(stream, 404, "text/plain", b"Not Found");
-        }
-        Err(e) => return Err(e),
+        Err(_) => return respond(stream, 404, "text/plain", b"Not Found"),
     };
 
-    let file_len = file.metadata()?.len();
-    if file_len == 0 {
-        if range_header.is_some() {
-            let resp = "HTTP/1.1 416 Range Not Satisfiable\r\nContent-Range: bytes */0\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
-            stream.write_all(resp.as_bytes())?;
-            return Ok(());
+    const CHUNK_SIZE: usize = 64 * 1024;
+    let mut buf = vec![0u8; CHUNK_SIZE];
+
+    if let Some(range) = range_header {
+        // Parse Range: bytes=start-end, bytes=start-, bytes=-suffix
+        if !range.starts_with("bytes=") {
+            return respond(
+                stream,
+                400,
+                "text/plain",
+                b"Bad Request: Invalid Range unit",
+            );
         }
-        let content_type = content_type_from_path(file_path);
-        let header = format!(
-            "HTTP/1.1 200 OK\r\nContent-Type: {}\r\nContent-Length: 0\r\nAccept-Ranges: bytes\r\nConnection: close\r\n\r\n",
-            content_type
-        );
-        stream.write_all(header.as_bytes())?;
-        record_download_completion(state, once, max_downloads);
-        return Ok(());
-    }
+        let range_spec = &range[6..];
+        let (start, end) = if range_spec.starts_with('-') {
+            // suffix-byte-range-spec: bytes=-suffix
+            let suffix: u64 = match range_spec[1..].parse() {
+                Ok(s) => s,
+                Err(_) => {
+                    return respond(
+                        stream,
+                        400,
+                        "text/plain",
+                        b"Bad Request: Invalid Range suffix",
+                    )
+                }
+            };
+            if file_size == 0 || suffix == 0 {
+                // Guard: any Range on 0-byte file returns 416
+                let cr = format!("bytes */{}", file_size);
+                return respond_headers(
+                    stream,
+                    416,
+                    &[
+                        ("Content-Type", "text/plain"),
+                        ("Content-Range", &cr),
+                        ("Accept-Ranges", "bytes"),
+                        ("Connection", "close"),
+                    ],
+                    Some(b"Range Not Satisfiable"),
+                );
+            }
+            let start = file_size.saturating_sub(suffix);
+            (start, file_size - 1)
+        } else if range_spec.ends_with('-') {
+            // bytes=start-
+            let start: u64 = match range_spec[..range_spec.len() - 1].parse() {
+                Ok(s) => s,
+                Err(_) => {
+                    return respond(
+                        stream,
+                        400,
+                        "text/plain",
+                        b"Bad Request: Invalid Range start",
+                    )
+                }
+            };
+            if start >= file_size {
+                let cr = format!("bytes */{}", file_size);
+                return respond_headers(
+                    stream,
+                    416,
+                    &[
+                        ("Content-Type", "text/plain"),
+                        ("Content-Range", &cr),
+                        ("Accept-Ranges", "bytes"),
+                        ("Connection", "close"),
+                    ],
+                    Some(b"Range Not Satisfiable"),
+                );
+            }
+            (start, file_size - 1)
+        } else {
+            // bytes=start-end
+            let parts: Vec<&str> = range_spec.split('-').collect();
+            if parts.len() != 2 {
+                return respond(
+                    stream,
+                    400,
+                    "text/plain",
+                    b"Bad Request: Invalid Range format",
+                );
+            }
+            let start: u64 = match parts[0].parse() {
+                Ok(s) => s,
+                Err(_) => {
+                    return respond(
+                        stream,
+                        400,
+                        "text/plain",
+                        b"Bad Request: Invalid Range start",
+                    )
+                }
+            };
+            let end: u64 = match parts[1].parse() {
+                Ok(e) => e,
+                Err(_) => {
+                    return respond(stream, 400, "text/plain", b"Bad Request: Invalid Range end")
+                }
+            };
+            if start > end || start >= file_size {
+                let cr = format!("bytes */{}", file_size);
+                return respond_headers(
+                    stream,
+                    416,
+                    &[
+                        ("Content-Type", "text/plain"),
+                        ("Content-Range", &cr),
+                        ("Accept-Ranges", "bytes"),
+                        ("Connection", "close"),
+                    ],
+                    Some(b"Range Not Satisfiable"),
+                );
+            }
+            let end = end.min(file_size - 1);
+            (start, end)
+        };
 
-    // Parse Range header if present.
-    let range = parse_range_header(range_header, file_len);
-    let (start, raw_end) = match range {
-        Some((s, e)) => (s, e),
-        None => (0, file_len - 1),
-    };
+        // Valid range: send 206 Partial Content
+        let content_length = end - start + 1;
+        let cr = format!("bytes {}-{}/{}", start, end, file_size);
+        respond_headers(
+            stream,
+            206,
+            &[
+                ("Content-Type", "application/octet-stream"),
+                ("Content-Range", &cr),
+                ("Accept-Ranges", "bytes"),
+                ("Content-Length", &content_length.to_string()),
+                ("Connection", "close"),
+            ],
+            None,
+        )?;
 
-    if start > raw_end || start >= file_len {
-        let resp = format!(
-            "HTTP/1.1 416 Range Not Satisfiable\r\nContent-Range: bytes */{}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
-            file_len
-        );
-        stream.write_all(resp.as_bytes())?;
-        return Ok(());
-    }
-    let end = raw_end.min(file_len - 1);
+        // Seek to start
+        std::io::Seek::seek(&mut file, std::io::SeekFrom::Start(start))?;
 
-    let content_length = end - start + 1;
-    let status = if range.is_some() { 206 } else { 200 };
-    let status_text = if status == 206 { "Partial Content" } else { "OK" };
-    let content_type = content_type_from_path(file_path);
-
-    let mut header = format!(
-        "HTTP/1.1 {} {}\r\nContent-Type: {}\r\nContent-Length: {}\r\nAccept-Ranges: bytes\r\nConnection: close\r\n",
-        status, status_text, content_type, content_length
-    );
-    if range.is_some() {
-        header.push_str(&format!("Content-Range: bytes {}-{}/{}\r\n", start, end, file_len));
-    }
-    header.push_str("\r\n");
-    stream.write_all(header.as_bytes())?;
-
-    file.seek(std::io::SeekFrom::Start(start))?;
-
-    // Stream in 64 KiB chunks.
-    let mut remaining = content_length;
-    let mut chunk = vec![0u8; DOWNLOAD_CHUNK_SIZE.min(content_length as usize)];
-    while remaining > 0 {
-        let to_read = chunk.len().min(remaining as usize);
-        let n = file.read(&mut chunk[..to_read])?;
-        if n == 0 {
-            break;
+        // Stream range
+        let mut remaining = content_length;
+        while remaining > 0 {
+            touch_activity(state);
+            let to_read = (CHUNK_SIZE as u64).min(remaining) as usize;
+            let n = file.read(&mut buf[..to_read])?;
+            if n == 0 {
+                break;
+            }
+            stream.write_all(&buf[..n])?;
+            remaining -= n as u64;
         }
-        stream.write_all(&chunk[..n])?;
-        remaining -= n as u64;
+    } else {
+        // No Range header: full download
+        respond_headers(
+            stream,
+            200,
+            &[
+                ("Content-Type", "application/octet-stream"),
+                ("Accept-Ranges", "bytes"),
+                ("Content-Length", &file_size.to_string()),
+                ("Connection", "close"),
+            ],
+            None,
+        )?;
+
+        // Stream entire file
+        loop {
+            touch_activity(state);
+            let n = file.read(&mut buf)?;
+            if n == 0 {
+                break;
+            }
+            stream.write_all(&buf[..n])?;
+        }
     }
 
-    // Only record a completed download if all requested bytes were transferred and
-    // either the request was un-ranged or reached the final byte of the file.
-    if remaining == 0 && (range.is_none() || end + 1 == file_len) {
-        record_download_completion(state, once, max_downloads);
-    }
-
-    Ok(())
-}
-
-fn record_download_completion(
-    state: &Arc<Mutex<SessionState>>,
-    once: bool,
-    max_downloads: Option<u32>,
-) {
+    // Update downloads_completed and check once/max_downloads
     let mut st = lock_state(state);
     st.downloads_completed += 1;
-    if once || max_downloads.is_some_and(|max| st.downloads_completed >= max) {
+    if st.once
+        || st
+            .max_downloads
+            .map_or(false, |max| st.downloads_completed >= max)
+    {
         st.active = false;
     }
+
+    Ok(())
 }
 
-/// Parse the Range header value (e.g., "bytes=0-1023") into (start, end).
-/// Returns None if header is missing, malformed, or unsatisfiable.
-/// End is inclusive.
-fn parse_range_header(range_header: Option<String>, file_len: u64) -> Option<(u64, u64)> {
-    let range_header = range_header?;
-    if file_len == 0 {
-        return None;
-    }
-    let range_header = range_header.strip_prefix("bytes=")?;
-    let (start_str, end_str) = range_header.split_once('-')?;
-
-    if start_str.is_empty() && end_str.is_empty() {
-        return None;
-    }
-
-    let start = if start_str.is_empty() {
-        // Suffix-byte-range: bytes=-500 means last 500 bytes
-        let suffix = end_str.parse::<u64>().ok()?;
-        if suffix == 0 {
-            return None;
-        }
-        if suffix >= file_len {
-            0
+fn serve_download_all(stream: &mut TcpStream, state: &Arc<Mutex<SessionState>>) -> io::Result<()> {
+    touch_activity(state);
+    // Snapshot zip_roots (or shared_paths fallback) under lock
+    let shared_paths = {
+        let st = lock_state(state);
+        if st.zip_roots.is_empty() {
+            st.shared_paths.clone()
         } else {
-            file_len - suffix
+            st.zip_roots.clone()
         }
-    } else {
-        start_str.parse::<u64>().ok()?
     };
 
-    let end = if end_str.is_empty() || start_str.is_empty() {
-        file_len - 1
-    } else {
-        end_str.parse::<u64>().ok()?
-    };
-
-    Some((start, end))
-}
-
-/// Guess content type from file extension (simple built-in mapping).
-fn content_type_from_path(path: &Path) -> String {
-    match path.extension().and_then(|e| e.to_str()) {
-        Some("html") | Some("htm") => "text/html",
-        Some("txt") => "text/plain",
-        Some("css") => "text/css",
-        Some("js") | Some("mjs") => "application/javascript",
-        Some("json") => "application/json",
-        Some("png") => "image/png",
-        Some("jpg") | Some("jpeg") => "image/jpeg",
-        Some("gif") => "image/gif",
-        Some("webp") => "image/webp",
-        Some("svg") => "image/svg+xml",
-        Some("mp4") => "video/mp4",
-        Some("webm") => "video/webm",
-        Some("mp3") => "audio/mpeg",
-        Some("wav") => "audio/wav",
-        Some("pdf") => "application/pdf",
-        Some("zip") => "application/zip",
-        Some("tar") => "application/x-tar",
-        Some("gz") => "application/gzip",
-        _ => "application/octet-stream",
+    // Collect all regular files, skipping symlinks
+    let mut entries = Vec::new();
+    for root in &shared_paths {
+        if root.is_dir() {
+            collect_files(root, root, &mut entries)?;
+        } else if root.is_file() {
+            let name = root
+                .file_name()
+                .and_then(|n| n.to_str())
+                .unwrap_or("file")
+                .to_string();
+            entries.push((name, root.clone()));
+        }
     }
-    .to_string()
-}
-
-/// Stream all shared files as a ZIP archive without reading files into memory.
-fn serve_download_all(
-    stream: &mut TcpStream,
-    share_paths: &[PathBuf],
-) -> io::Result<()> {
-    let entries = collect_zip_entries(share_paths)?;
 
     if entries.is_empty() {
-        return respond(stream, 404, "text/plain", b"No files to download");
+        return respond(
+            stream,
+            404,
+            "text/plain",
+            b"Not Found: No files to download",
+        );
     }
 
-    let header = "HTTP/1.1 200 OK\r\nContent-Type: application/zip\r\nContent-Disposition: attachment; filename=\"download-all.zip\"\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n";
-    stream.write_all(header.as_bytes())?;
+    // Write HTTP 200 headers with chunked encoding
+    let headers = [
+        ("Content-Type", "application/zip"),
+        (
+            "Content-Disposition",
+            "attachment; filename=\"lanbeam-files.zip\"",
+        ),
+        ("Transfer-Encoding", "chunked"),
+        ("Connection", "close"),
+    ];
+    respond_headers(stream, 200, &headers, None)?;
 
-    let mut writer = ChunkedWriter::new(stream);
-    write_zip_files(&mut writer, &entries)?;
-    writer.finish()?;
+    // Stream ZIP via ChunkedWriter
+    let mut chunked = ChunkedWriter::new(stream, 65536);
+    let mut activity_writer = ActivityWriter {
+        writer: &mut chunked,
+        state,
+    };
+    let _count = crate::zip::stream_zip_entries(&mut activity_writer, &entries)?;
+    drop(activity_writer);
+    chunked.finish()?;
+
+    // Update downloads_completed and check once/max_downloads
+    let mut st = lock_state(state);
+    st.downloads_completed += 1;
+    if st.once
+        || st
+            .max_downloads
+            .map_or(false, |max| st.downloads_completed >= max)
+    {
+        st.active = false;
+    }
 
     Ok(())
 }
 
-/// Collect regular files from `share_paths` without following symlinks.
-fn collect_zip_entries(share_paths: &[PathBuf]) -> io::Result<Vec<ZipFileEntry>> {
-    let mut entries = Vec::new();
-    for path in share_paths {
-        let meta = match fs::symlink_metadata(path) {
-            Ok(m) => m,
-            Err(e) if e.kind() == io::ErrorKind::NotFound => continue,
-            Err(e) => return Err(e),
-        };
-        if meta.file_type().is_symlink() {
-            continue;
-        }
-        if meta.is_file() {
-            if let Some(name) = path.file_name().map(|n| n.to_string_lossy().replace('\\', "/")) {
-                entries.push(ZipFileEntry {
-                    name,
-                    path: path.clone(),
-                });
-            }
-        } else if meta.is_dir() {
-            let root_canon = fs::canonicalize(path)?;
-            collect_dir_entries(&root_canon, &root_canon, &mut entries)?;
-        }
-    }
-    Ok(entries)
-}
-
-/// Recursively collect regular files from a directory, skipping symlinks and
-/// enforcing that every entry stays under `root_canon`.
-fn collect_dir_entries(
-    root_canon: &Path,
-    current: &Path,
-    entries: &mut Vec<ZipFileEntry>,
-) -> io::Result<()> {
-    for entry in fs::read_dir(current)? {
-        let entry = entry?;
-        let path = entry.path();
-        let meta = match fs::symlink_metadata(&path) {
-            Ok(m) => m,
-            Err(e) if e.kind() == io::ErrorKind::NotFound => continue,
-            Err(e) => return Err(e),
-        };
-        if meta.file_type().is_symlink() {
-            continue;
-        }
-        let canon = fs::canonicalize(&path)?;
-        if !canon.starts_with(root_canon) {
-            continue;
-        }
-        if meta.is_file() {
-            let rel_path = canon.strip_prefix(root_canon).map_err(|e| {
-                io::Error::new(io::ErrorKind::Other, format!("strip_prefix failed: {e}"))
-            })?;
-            let name = rel_path.to_string_lossy().replace('\\', "/");
-            entries.push(ZipFileEntry { name, path: canon });
-        } else if meta.is_dir() {
-            collect_dir_entries(root_canon, &canon, entries)?;
-        }
-    }
-    Ok(())
-}
-
-/// Writer that outputs chunked transfer encoding.
-struct ChunkedWriter<W: Write> {
-    inner: W,
-}
-
-impl<W: Write> ChunkedWriter<W> {
-    fn new(inner: W) -> Self {
-        Self { inner }
-    }
-
-    fn finish(&mut self) -> io::Result<()> {
-        // Write final chunk (0 length).
-        self.inner.write_all(b"0\r\n\r\n")
-    }
-}
-
-impl<W: Write> Write for ChunkedWriter<W> {
-    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
-        if buf.is_empty() {
-            return Ok(0);
-        }
-        // Write chunk size in hex.
-        let size_hex = format!("{:x}\r\n", buf.len());
-        self.inner.write_all(size_hex.as_bytes())?;
-        self.inner.write_all(buf)?;
-        self.inner.write_all(b"\r\n")?;
-        Ok(buf.len())
-    }
-
-    fn flush(&mut self) -> io::Result<()> {
-        self.inner.flush()
-    }
-}
-
-/// Stream a `POST /<token>/upload?name=<filename>` request body to disk.
-///
-/// Requires `Content-Length`, streams bytes in `UPLOAD_CHUNK_SIZE` (64 KiB)
-/// chunks into an exclusive `.<name>.lanbeam.part` file in `dest`, cleans up on
-/// incomplete or errored transfers, and commits atomically without overwriting
-/// existing files (`file_1.ext`, ...).
 fn serve_upload(
     stream: &mut TcpStream,
-    path: &str,
     state: &Arc<Mutex<SessionState>>,
-    dest: &Path,
-    body: &[u8],
-    content_length: Option<usize>,
-    max_uploads: Option<u32>,
+    query: Option<&str>,
+    initial_body: &[u8],
+    headers_str: &str,
 ) -> io::Result<()> {
-    let Some(total) = content_length else {
-        return respond(stream, 411, "text/plain", b"Length Required");
+    touch_activity(state);
+    let filename = query.unwrap_or("").split('&').find_map(|pair| {
+        let (key, value) = pair.split_once('=')?;
+        (key == "name" && !value.is_empty()).then_some(value)
+    });
+    let filename = match filename {
+        Some(name) => name,
+        None => return respond(stream, 400, "text/plain", b"Bad Request: Missing filename"),
     };
+    let decoded = match percent_decode(filename) {
+        Ok(name) => name,
+        Err(()) => return respond(stream, 400, "text/plain", b"Bad Request: Invalid filename"),
+    };
+    let safe_name = decoded
+        .split(['/', '\\'])
+        .filter(|s| !s.is_empty())
+        .last()
+        .unwrap_or("")
+        .trim();
+    if safe_name.is_empty() || safe_name == "." || safe_name == ".." || safe_name.len() > 255 {
+        return respond(stream, 400, "text/plain", b"Bad Request: Invalid filename");
+    }
 
-    let raw_name = extract_query_param(path, "name").unwrap_or_else(|| "upload".to_string());
-    let decoded_name = percent_decode(&raw_name);
-    let safe_name = cap_filename_bytes(&sanitize_filename(&decoded_name), MAX_UPLOAD_FILENAME_BYTES);
+    // Check for chunked transfer encoding first
+    if has_transfer_encoding(headers_str)
+        && (!is_chunked_transfer(headers_str) || get_content_length(headers_str).is_some())
+    {
+        return respond(
+            stream,
+            400,
+            "text/plain",
+            b"Bad Request: Unsupported or ambiguous Transfer-Encoding",
+        );
+    }
+    if is_chunked_transfer(headers_str) {
+        return serve_upload_chunked(stream, state, query, initial_body, headers_str, safe_name);
+    }
 
-    fs::create_dir_all(dest)?;
+    // Content-Length path
+    let content_length = match get_content_length(headers_str) {
+        Some(n) if n <= 10 * 1024 * 1024 * 1024 => n as u64,
+        Some(_) => {
+            return respond(
+                stream,
+                400,
+                "text/plain",
+                b"Bad Request: Content-Length too large",
+            )
+        }
+        None => {
+            return respond(
+                stream,
+                400,
+                "text/plain",
+                b"Bad Request: Missing Content-Length",
+            )
+        }
+    };
+    let dest_dir = lock_state(state).dest_dir.clone();
+    if std::fs::create_dir_all(&dest_dir).is_err() {
+        return respond(stream, 500, "text/plain", b"Internal Server Error");
+    }
 
-    let (part_path, mut file) = create_unique_part_file(dest, &safe_name)?;
-
-    let write_res = stream_upload_bytes(stream, &mut file, body, total);
-    let written = match write_res {
-        Ok(n) => n,
-        Err(e) => {
-            drop(file);
-            let _ = fs::remove_file(&part_path);
-            return Err(e);
+    // Reserve both names atomically per upload so independent filenames start at suffix 0
+    // while concurrent collisions retry cleanly with _1, _2, ...
+    let mut next_suffix: u64 = 0;
+    let (final_name, final_path, part_path, mut file) = loop {
+        let suffix = next_suffix;
+        next_suffix += 1;
+        let candidate = if suffix == 0 {
+            safe_name.to_string()
+        } else {
+            match safe_name.rsplit_once('.') {
+                Some((stem, ext)) if !stem.is_empty() => format!("{}_{}.{}", stem, suffix, ext),
+                _ => format!("{}_{}", safe_name, suffix),
+            }
+        };
+        let final_path = dest_dir.join(&candidate);
+        let part_path = dest_dir.join(format!(".{}.lanbeam.part", candidate));
+        let reservation = match std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&final_path)
+        {
+            Ok(f) => f,
+            Err(e) if e.kind() == io::ErrorKind::AlreadyExists => continue,
+            Err(_) => {
+                return respond(
+                    stream,
+                    500,
+                    "text/plain",
+                    b"Internal Server Error: Failed to reserve upload name",
+                )
+            }
+        };
+        drop(reservation);
+        match std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&part_path)
+        {
+            Ok(file) => break (candidate, final_path, part_path, file),
+            Err(e) if e.kind() == io::ErrorKind::AlreadyExists => {
+                let _ = std::fs::remove_file(&final_path);
+                continue;
+            }
+            Err(_) => {
+                let _ = std::fs::remove_file(&final_path);
+                return respond(
+                    stream,
+                    500,
+                    "text/plain",
+                    b"Internal Server Error: Failed to create upload file",
+                );
+            }
         }
     };
 
-    if let Err(e) = file.flush() {
+    let fail_cleanup = |file: std::fs::File| {
         drop(file);
-        let _ = fs::remove_file(&part_path);
-        return Err(e);
+        let _ = std::fs::remove_file(&part_path);
+        let _ = std::fs::remove_file(&final_path);
+    };
+    let initial = initial_body.len().min(content_length as usize);
+    if file.write_all(&initial_body[..initial]).is_err() {
+        fail_cleanup(file);
+        return respond(
+            stream,
+            500,
+            "text/plain",
+            b"Internal Server Error: Write failed",
+        );
+    }
+    let mut written = initial as u64;
+    let mut buf = [0u8; 64 * 1024];
+    while written < content_length {
+        let limit = buf.len().min((content_length - written) as usize);
+        match stream.read(&mut buf[..limit]) {
+            Ok(0) => {
+                fail_cleanup(file);
+                return respond(stream, 400, "text/plain", b"Bad Request: Premature EOF");
+            }
+            Ok(n) => {
+                touch_activity(state);
+                if file.write_all(&buf[..n]).is_err() {
+                    fail_cleanup(file);
+                    return respond(
+                        stream,
+                        500,
+                        "text/plain",
+                        b"Internal Server Error: Write failed",
+                    );
+                }
+                written += n as u64;
+            }
+            Err(e) => {
+                fail_cleanup(file);
+                let (status, message) = if e.kind() == io::ErrorKind::TimedOut
+                    || e.kind() == io::ErrorKind::WouldBlock
+                {
+                    (400, b"Bad Request: Premature EOF" as &[u8])
+                } else {
+                    (500, b"Internal Server Error: Read failed" as &[u8])
+                };
+                return respond(stream, status, "text/plain", message);
+            }
+        }
+    }
+    if file.flush().is_err() {
+        fail_cleanup(file);
+        return respond(
+            stream,
+            500,
+            "text/plain",
+            b"Internal Server Error: Flush failed",
+        );
     }
     drop(file);
-
-    if written != total {
-        let _ = fs::remove_file(&part_path);
-        let _ = respond(stream, 400, "text/plain", b"Incomplete Upload");
-        return Ok(());
+    if std::fs::rename(&part_path, &final_path).is_err() {
+        let _ = std::fs::remove_file(&part_path);
+        let _ = std::fs::remove_file(&final_path);
+        return respond(
+            stream,
+            500,
+            "text/plain",
+            b"Internal Server Error: Rename failed",
+        );
     }
-
-    let final_name = match commit_part_unique(dest, &safe_name, &part_path) {
-        Ok(name) => name,
-        Err(e) => {
-            let _ = fs::remove_file(&part_path);
-            return Err(e);
-        }
-    };
-
     {
         let mut st = lock_state(state);
         st.uploads_received += 1;
-        if max_uploads.is_some_and(|max| st.uploads_received >= max) {
+        st.files.push(final_name.clone());
+        if st
+            .max_uploads
+            .map_or(false, |max| st.uploads_received >= max)
+        {
             st.active = false;
         }
     }
-
-    let mut cmd = Command::new("notify-send");
-    cmd.args(["lanbeam", &format!("Received {}", final_name)]);
-    spawn_detached(cmd);
-
-    respond(stream, 200, "application/json", b"{\"ok\":true}")
+    #[cfg(not(test))]
+    {
+        let _ = std::process::Command::new("notify-send")
+            .args(["lanbeam", &format!("Received: {}", final_name)])
+            .status();
+    }
+    let body = format!(
+        "{{\"ok\":true,\"filename\":\"{}\"}}",
+        escape_json(&final_name)
+    );
+    respond(stream, 200, "application/json", body.as_bytes())
 }
 
-fn stream_upload_bytes(
+/// Handle upload with chunked transfer encoding.
+fn serve_upload_chunked(
     stream: &mut TcpStream,
-    file: &mut fs::File,
+    state: &Arc<Mutex<SessionState>>,
+    _query: Option<&str>,
     initial_body: &[u8],
-    total: usize,
-) -> io::Result<usize> {
-    let mut written = 0usize;
-    if !initial_body.is_empty() {
-        let take = initial_body.len().min(total);
-        file.write_all(&initial_body[..take])?;
-        written += take;
+    _headers_str: &str,
+    safe_name: &str,
+) -> io::Result<()> {
+    let dest_dir = lock_state(state).dest_dir.clone();
+    if std::fs::create_dir_all(&dest_dir).is_err() {
+        return respond(stream, 500, "text/plain", b"Internal Server Error");
     }
 
-    let mut chunk = [0u8; UPLOAD_CHUNK_SIZE];
-    while written < total {
-        let need = (total - written).min(chunk.len());
-        match stream.read(&mut chunk[..need])? {
-            0 => break,
-            n => {
-                file.write_all(&chunk[..n])?;
-                written += n;
-            }
-        }
-    }
-    Ok(written)
-}
-
-fn create_unique_part_file(dest: &Path, safe_name: &str) -> io::Result<(PathBuf, fs::File)> {
-    let primary = dest.join(format!(".{}.lanbeam.part", safe_name));
-    match OpenOptions::new().write(true).create_new(true).open(&primary) {
-        Ok(f) => return Ok((primary, f)),
-        Err(e) if e.kind() == io::ErrorKind::AlreadyExists => {}
-        Err(e) => return Err(e),
-    }
-
-    loop {
-        let seq = PART_SEQ.fetch_add(1, Ordering::Relaxed);
-        let alt_base = cap_filename_bytes(safe_name, MAX_UPLOAD_FILENAME_BYTES.saturating_sub(24));
-        let candidate = dest.join(format!(".{}.{}.lanbeam.part", alt_base, seq));
-        match OpenOptions::new().write(true).create_new(true).open(&candidate) {
-            Ok(f) => return Ok((candidate, f)),
-            Err(e) if e.kind() == io::ErrorKind::AlreadyExists => continue,
-            Err(e) => return Err(e),
-        }
-    }
-}
-
-fn commit_part_unique(dest: &Path, safe_name: &str, part_path: &Path) -> io::Result<String> {
-    for counter in 0u32.. {
-        let candidate = if counter == 0 {
+    // Reserve both names atomically per upload
+    let mut next_suffix: u64 = 0;
+    let (final_name, final_path, part_path, mut file) = loop {
+        let suffix = next_suffix;
+        next_suffix += 1;
+        let candidate = if suffix == 0 {
             safe_name.to_string()
         } else {
-            increment_name(safe_name, counter)
+            match safe_name.rsplit_once('.') {
+                Some((stem, ext)) if !stem.is_empty() => format!("{}_{}.{}", stem, suffix, ext),
+                _ => format!("{}_{}", safe_name, suffix),
+            }
         };
-        let final_path = dest.join(&candidate);
-        match fs::hard_link(part_path, &final_path) {
-            Ok(()) => {
-                let _ = fs::remove_file(part_path);
-                return Ok(candidate);
-            }
+        let final_path = dest_dir.join(&candidate);
+        let part_path = dest_dir.join(format!(".{}.lanbeam.part", candidate));
+        let reservation = match std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&final_path)
+        {
+            Ok(f) => f,
             Err(e) if e.kind() == io::ErrorKind::AlreadyExists => continue,
-            Err(e) if e.kind() == io::ErrorKind::Unsupported => {
-                if !final_path.exists() {
-                    fs::rename(part_path, &final_path)?;
-                    return Ok(candidate);
+            Err(_) => {
+                return respond(
+                    stream,
+                    500,
+                    "text/plain",
+                    b"Internal Server Error: Failed to reserve upload name",
+                )
+            }
+        };
+        drop(reservation);
+        match std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&part_path)
+        {
+            Ok(file) => break (candidate, final_path, part_path, file),
+            Err(e) if e.kind() == io::ErrorKind::AlreadyExists => {
+                let _ = std::fs::remove_file(&final_path);
+                continue;
+            }
+            Err(_) => {
+                let _ = std::fs::remove_file(&final_path);
+                return respond(
+                    stream,
+                    500,
+                    "text/plain",
+                    b"Internal Server Error: Failed to create upload file",
+                );
+            }
+        }
+    };
+
+    let fail_cleanup = |file: std::fs::File| {
+        drop(file);
+        let _ = std::fs::remove_file(&part_path);
+        let _ = std::fs::remove_file(&final_path);
+    };
+
+    // Use the shared chunked body reader with max 10 GiB
+    let result = read_chunked_body(
+        stream,
+        initial_body,
+        state,
+        10 * 1024 * 1024 * 1024,
+        |chunk| {
+            touch_activity(state);
+            file.write_all(chunk)
+                .map_err(|_| (500, "Internal Server Error: Write failed"))
+        },
+    );
+
+    match result {
+        Ok(_) => {
+            // Success
+            if file.flush().is_err() {
+                fail_cleanup(file);
+                return respond(
+                    stream,
+                    500,
+                    "text/plain",
+                    b"Internal Server Error: Flush failed",
+                );
+            }
+            drop(file);
+            if std::fs::rename(&part_path, &final_path).is_err() {
+                let _ = std::fs::remove_file(&part_path);
+                let _ = std::fs::remove_file(&final_path);
+                return respond(
+                    stream,
+                    500,
+                    "text/plain",
+                    b"Internal Server Error: Rename failed",
+                );
+            }
+            {
+                let mut st = lock_state(state);
+                st.uploads_received += 1;
+                st.files.push(final_name.clone());
+                if st
+                    .max_uploads
+                    .map_or(false, |max| st.uploads_received >= max)
+                {
+                    st.active = false;
                 }
             }
-            Err(e) => return Err(e),
+            #[cfg(not(test))]
+            {
+                let _ = std::process::Command::new("notify-send")
+                    .args(["lanbeam", &format!("Received: {}", final_name)])
+                    .status();
+            }
+            let body = format!(
+                "{{\"ok\":true,\"filename\":\"{}\"}}",
+                escape_json(&final_name)
+            );
+            respond(stream, 200, "application/json", body.as_bytes())
+        }
+        Err((status, message)) => {
+            fail_cleanup(file);
+            respond(stream, status, "text/plain", message.as_bytes())
         }
     }
-    Err(io::Error::new(
-        io::ErrorKind::AlreadyExists,
-        "exhausted unique filenames",
-    ))
 }
 
-/// Extract a query parameter value from a request path, e.g. `?name=file.txt`.
-fn extract_query_param(path: &str, key: &str) -> Option<String> {
-    let (_path, query) = path.split_once('?')?;
-    query.split('&').find_map(|kv| {
-        let (k, v) = kv.split_once('=')?;
-        if k == key {
-            Some(v.to_string())
-        } else {
-            None
-        }
-    })
-}
+fn extract_json_text_field(body: &str) -> Option<String> {
+    let key_pos = body.find("\"text\"")?;
+    let after_key = body[key_pos + "\"text\"".len()..].trim_start();
+    let after_colon = after_key.strip_prefix(':')?.trim_start();
+    let rest = after_colon.strip_prefix('"')?;
 
-/// Percent-decode a URL query value (`+` as space, `%XX` as raw byte).
-fn percent_decode(input: &str) -> String {
-    let bytes = input.as_bytes();
-    let mut out = Vec::with_capacity(bytes.len());
-    let mut i = 0;
-    while i < bytes.len() {
-        match bytes[i] {
-            b'+' => {
-                out.push(b' ');
-                i += 1;
-            }
-            b'%' if i + 2 < bytes.len() => {
-                if let (Some(hi), Some(lo)) = (hex_val(bytes[i + 1]), hex_val(bytes[i + 2])) {
-                    out.push((hi << 4) | lo);
-                    i += 3;
-                    continue;
+    let mut out = String::new();
+    let mut chars = rest.chars();
+    while let Some(c) = chars.next() {
+        match c {
+            '"' => return Some(out),
+            '\\' => match chars.next()? {
+                '"' => out.push('"'),
+                '\\' => out.push('\\'),
+                '/' => out.push('/'),
+                'b' => out.push('\u{0008}'),
+                'f' => out.push('\u{000C}'),
+                'n' => out.push('\n'),
+                'r' => out.push('\r'),
+                't' => out.push('\t'),
+                'u' => {
+                    let mut hex = String::with_capacity(4);
+                    for _ in 0..4 {
+                        hex.push(chars.next()?);
+                    }
+                    if let Ok(code) = u32::from_str_radix(&hex, 16) {
+                        if let Some(ch) = char::from_u32(code) {
+                            out.push(ch);
+                        }
+                    }
                 }
-                out.push(b'%');
-                i += 1;
-            }
-            b => {
-                out.push(b);
-                i += 1;
-            }
+                other => out.push(other),
+            },
+            ch => out.push(ch),
         }
     }
-    String::from_utf8_lossy(&out).into_owned()
-}
-
-fn hex_val(b: u8) -> Option<u8> {
-    match b {
-        b'0'..=b'9' => Some(b - b'0'),
-        b'a'..=b'f' => Some(b - b'a' + 10),
-        b'A'..=b'F' => Some(b - b'A' + 10),
-        _ => None,
-    }
-}
-
-/// Truncate a sanitized filename (keeping its final extension if any) to fit `max_bytes`.
-fn cap_filename_bytes(name: &str, max_bytes: usize) -> String {
-    if name.len() <= max_bytes {
-        return name.to_string();
-    }
-    if let Some(dot) = name.rfind('.') {
-        let ext = &name[dot..];
-        if dot > 0 && ext.len() < max_bytes {
-            let keep = max_bytes - ext.len();
-            let prefix = truncate_utf8(&name[..dot], keep);
-            if !prefix.is_empty() {
-                return format!("{prefix}{ext}");
-            }
-        }
-    }
-    let truncated = truncate_utf8(name, max_bytes);
-    if truncated.is_empty() {
-        "upload".to_string()
-    } else {
-        truncated.to_string()
-    }
-}
-
-fn truncate_utf8(s: &str, max_bytes: usize) -> &str {
-    if s.len() <= max_bytes {
-        return s;
-    }
-    let mut end = max_bytes;
-    while end > 0 && !s.is_char_boundary(end) {
-        end -= 1;
-    }
-    &s[..end]
-}
-
-/// Strip directory components and unsafe characters from a filename.
-/// Empty or `.`/`..` names fall back to `"upload"`.
-fn sanitize_filename(name: &str) -> String {
-    let replaced = name.replace('\\', "/");
-    let basename = replaced.split('/').last().unwrap_or("").trim();
-
-    let cleaned: String = basename
-        .chars()
-        .map(|c| {
-            if c.is_ascii_control() || c == '\u{7f}' {
-                '_'
-            } else {
-                c
-            }
-        })
-        .collect();
-
-    let cleaned = cleaned.trim_matches(|c| c == '.' || c == ' ');
-
-    if cleaned.is_empty() || cleaned == ".." {
-        "upload".to_string()
-    } else {
-        cleaned.to_string()
-    }
-}
-
-/// Return `name` if free in `dest`, otherwise `base_N.ext`, `base_(N+1).ext`, ...
-/// The number is inserted before the final extension.
-#[allow(dead_code)]
-fn unique_name(dest: &Path, name: &str) -> String {
-    let mut candidate = name.to_string();
-    let mut counter = 1u32;
-    while dest.join(&candidate).exists() {
-        candidate = increment_name(name, counter);
-        counter += 1;
-    }
-    candidate
-}
-
-/// Insert `_N` before the final extension of `name` (or append it).
-fn increment_name(name: &str, n: u32) -> String {
-    if let Some(dot) = name.rfind('.') {
-        if dot > 0 {
-            let (base, ext) = name.split_at(dot);
-            return format!("{}_{}{}", base, n, ext);
-        }
-    }
-    format!("{}_{}", name, n)
+    None
 }
 
 fn serve_text(
     stream: &mut TcpStream,
     state: &Arc<Mutex<SessionState>>,
     body: &str,
-    once: bool,
 ) -> io::Result<()> {
-    // Parse {"text": "..."} minimally without serde.
-    let text = body
-        .find("\"text\"")
-        .and_then(|text_key_pos| {
-            let after_key = &body[text_key_pos..];
-            after_key.find(':').map(|colon_pos| (text_key_pos, colon_pos))
-        })
-        .and_then(|(text_key_pos, colon_pos)| {
-            let s = &body[text_key_pos + colon_pos + 1..];
-            let s = s.trim_start();
-            let s = s.strip_prefix('"').unwrap_or(s);
-            let end = s.find('"').unwrap_or(s.len());
-            Some(s[..end].to_string())
-        })
-        .unwrap_or_default();
+    touch_activity(state);
+    let text = extract_json_text_field(body).unwrap_or_default();
 
     if !text.is_empty() {
+        let mut st = lock_state(state);
+        st.shared_text = Some(text.clone());
+        drop(st);
+
+        #[cfg(test)]
         {
-            let mut st = lock_state(state);
-            st.shared_text = Some(text.clone());
-            if once {
-                st.active = false;
-            }
+            // In tests, don't spawn external processes
         }
-
-        // Pipe to Wayland clipboard and notify the desktop without leaving zombies.
-        let mut wl = Command::new("wl-copy");
-        wl.arg(&text);
-        spawn_detached(wl);
-
-        let mut ns = Command::new("notify-send");
-        ns.args(["lanbeam", &text]);
-        spawn_detached(ns);
+        #[cfg(not(test))]
+        {
+            let _ = Command::new("wl-copy").arg(&text).status();
+            let _ = Command::new("notify-send")
+                .args(["lanbeam", &text])
+                .status();
+        }
     }
 
     respond(stream, 200, "application/json", b"{\"ok\":true}")
@@ -1158,980 +1846,1749 @@ fn serve_text(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::io::{Read, Write};
+    use std::net::TcpListener;
+    use std::os::unix::fs::symlink;
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::thread;
+    use std::time::Duration;
 
-    use std::io::Write;
-    use std::net::SocketAddr;
+    static TEST_COUNTER: AtomicU64 = AtomicU64::new(0);
+
+    fn unique_temp_dir(prefix: &str) -> std::path::PathBuf {
+        let id = TEST_COUNTER.fetch_add(1, Ordering::Relaxed);
+        std::env::temp_dir().join(format!("{}_{}_{}", prefix, std::process::id(), id))
+    }
+
+    fn start_test_server() -> (
+        String,
+        u16,
+        thread::JoinHandle<()>,
+        Arc<Mutex<SessionState>>,
+    ) {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let token = "testtoken123";
+        let session = ServerSession::new(listener, port, token).unwrap();
+        let state_clone = session.state.clone();
+        let handle = thread::spawn(move || {
+            let _ = session.run();
+        });
+        // Wait a bit for server to start
+        thread::sleep(Duration::from_millis(50));
+        (token.to_string(), port, handle, state_clone)
+    }
+
+    fn read_response(stream: &mut std::net::TcpStream) -> (u16, Vec<u8>, String) {
+        let mut buf = Vec::new();
+        stream.read_to_end(&mut buf).unwrap();
+
+        // Parse status line
+        let header_end = buf.windows(4).position(|w| w == b"\r\n\r\n").unwrap_or(0);
+        let headers = String::from_utf8_lossy(&buf[..header_end]);
+        let status_line = headers.lines().next().unwrap_or("");
+        let status: u16 = status_line
+            .split_whitespace()
+            .nth(1)
+            .unwrap_or("0")
+            .parse()
+            .unwrap_or(0);
+
+        // Check for chunked encoding
+        let is_chunked = headers.lines().any(|l| {
+            l.to_lowercase().starts_with("transfer-encoding:")
+                && l.to_lowercase().contains("chunked")
+        });
+
+        let content_range = headers
+            .lines()
+            .find(|l| l.to_lowercase().starts_with("content-range:"))
+            .map(|l| l.to_string())
+            .unwrap_or_default();
+
+        let body = if is_chunked {
+            // Decode chunked encoding
+            let mut body = Vec::new();
+            let mut pos = header_end + 4;
+            while pos < buf.len() {
+                // Find chunk size line
+                let line_end = buf[pos..]
+                    .windows(2)
+                    .position(|w| w == b"\r\n")
+                    .map(|p| p + pos);
+                let line_end = match line_end {
+                    Some(e) => e,
+                    None => break,
+                };
+                let chunk_size_line = String::from_utf8_lossy(&buf[pos..line_end]);
+                let chunk_size = usize::from_str_radix(chunk_size_line.trim(), 16).unwrap_or(0);
+                if chunk_size == 0 {
+                    break;
+                }
+                let data_start = line_end + 2;
+                let data_end = data_start + chunk_size;
+                if data_end > buf.len() {
+                    break;
+                }
+                body.extend_from_slice(&buf[data_start..data_end]);
+                pos = data_end + 2; // Skip \r\n after chunk data
+            }
+            body
+        } else {
+            if header_end + 4 < buf.len() {
+                buf[header_end + 4..].to_vec()
+            } else {
+                Vec::new()
+            }
+        };
+        (status, body, content_range)
+    }
+
+    fn http_get(port: u16, path: &str) -> (u16, Vec<u8>) {
+        let mut stream = std::net::TcpStream::connect(("127.0.0.1", port)).unwrap();
+        stream
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .unwrap();
+        let req = format!(
+            "GET {} HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n",
+            path
+        );
+        stream.write_all(req.as_bytes()).unwrap();
+
+        let (status, body, _) = read_response(&mut stream);
+        (status, body)
+    }
+
+    fn http_get_with_range(port: u16, path: &str, range: &str) -> (u16, Vec<u8>, String) {
+        let mut stream = std::net::TcpStream::connect(("127.0.0.1", port)).unwrap();
+        stream
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .unwrap();
+        let req = format!(
+            "GET {} HTTP/1.1\r\nHost: localhost\r\nRange: {}\r\nConnection: close\r\n\r\n",
+            path, range
+        );
+        stream.write_all(req.as_bytes()).unwrap();
+
+        let (status, body, content_range) = read_response(&mut stream);
+        (status, body, content_range)
+    }
+
+    fn http_post_text(port: u16, token: &str, text: &str) -> (u16, Vec<u8>) {
+        let mut stream = std::net::TcpStream::connect(("127.0.0.1", port)).unwrap();
+        stream
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .unwrap();
+        let body = format!("{{\"text\":\"{}\"}}", text);
+        let req = format!(
+            "POST /{}/text HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+            token,
+            body.len(),
+            body
+        );
+        stream.write_all(req.as_bytes()).unwrap();
+
+        let (status, body, _) = read_response(&mut stream);
+        (status, body)
+    }
 
     #[test]
     fn session_state_defaults() {
         let st = SessionState::default();
         assert!(st.active);
         assert_eq!(st.downloads_completed, 0);
-    }
-
-    // --- filename sanitization ---
-
-    #[test]
-    fn sanitize_strips_directory_components() {
-        assert_eq!(sanitize_filename("../../../etc/passwd"), "passwd");
-        assert_eq!(sanitize_filename("folder/photo.jpg"), "photo.jpg");
-        assert_eq!(sanitize_filename("a\\b\\c.txt"), "c.txt");
-        assert_eq!(sanitize_filename("./.config/secret"), "secret");
+        assert_eq!(st.shared_paths.len(), 0);
+        assert!(!st.once);
+        assert_eq!(st.max_downloads, None);
     }
 
     #[test]
-    fn sanitize_rejects_empty_dot_and_spaces() {
-        assert_eq!(sanitize_filename(""), "upload");
-        assert_eq!(sanitize_filename("."), "upload");
-        assert_eq!(sanitize_filename(".."), "upload");
-        assert_eq!(sanitize_filename("   "), "upload");
-    }
+    fn configure_send_sets_state() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let session = ServerSession::new(listener, port, "token123").unwrap();
 
-    #[test]
-    fn sanitize_replaces_control_characters() {
-        assert_eq!(sanitize_filename("a\u{0}b\u{7f}c"), "a_b_c");
-        assert_eq!(sanitize_filename("name\n\r\t.txt"), "name___.txt");
-    }
-
-    // --- deduplication ---
-
-    fn test_dest_dir() -> PathBuf {
-        let dir = std::env::temp_dir().join(format!(
-            "lanbeam-test-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .expect("clock")
-                .as_nanos()
-        ));
-        fs::create_dir_all(&dir).expect("create test upload dir");
-        dir
-    }
-
-    #[test]
-    fn unique_name_uses_name_when_free() {
-        let dir = test_dest_dir();
-        assert_eq!(unique_name(&dir, "file.txt"), "file.txt");
-        assert_eq!(unique_name(&dir, "README"), "README");
-    }
-
-    #[test]
-    fn unique_name_numbers_before_extension() {
-        let dir = test_dest_dir();
-        fs::File::create(dir.join("file.txt")).unwrap();
-        fs::File::create(dir.join("file_1.txt")).unwrap();
-        assert_eq!(unique_name(&dir, "file.txt"), "file_2.txt");
-    }
-
-    #[test]
-    fn unique_name_numbers_names_without_extension() {
-        let dir = test_dest_dir();
-        fs::File::create(dir.join("README")).unwrap();
-        assert_eq!(unique_name(&dir, "README"), "README_1");
-        fs::File::create(dir.join("README_1")).unwrap();
-        assert_eq!(unique_name(&dir, "README"), "README_2");
-    }
-
-    // --- upload over real HTTP ---
-
-    /// Accept one connection and consume its request headers (mirroring
-    /// `handle_connection`), returning the stream plus any body bytes that
-    /// arrived with the headers.
-    fn accept_upload(listener: &TcpListener) -> (TcpStream, Vec<u8>) {
-        let (mut stream, _) = listener.accept().expect("accept");
-        stream.set_nonblocking(false).expect("blocking stream");
-        let mut buf = Vec::new();
-        let mut tmp = [0u8; 4096];
-        loop {
-            let n = stream.read(&mut tmp).expect("read request headers");
-            assert!(n > 0, "client disconnected before sending headers");
-            buf.extend_from_slice(&tmp[..n]);
-            if buf.windows(4).any(|w| w == b"\r\n\r\n") {
-                break;
-            }
-        }
-        let start = buf
-            .windows(4)
-            .position(|w| w == b"\r\n\r\n")
-            .map(|i| i + 4)
-            .unwrap_or(buf.len());
-        (stream, buf[start..].to_vec())
-    }
-
-    fn upload_client(addr: SocketAddr, token: &str, name: &str, body: &[u8]) -> Vec<u8> {
-        let mut stream = TcpStream::connect(addr).expect("connect upload client");
-        let request = format!(
-            "POST /{}/upload?name={} HTTP/1.1\r\n\
-             host: localhost\r\n\
-             content-length: {}\r\n\
-             connection: close\r\n\
-             \r\n",
-            token,
-            name,
-            body.len()
-        );
-        stream.write_all(request.as_bytes()).expect("write request");
-        stream.write_all(body).expect("write body");
-        let mut response = Vec::new();
-        stream.read_to_end(&mut response).expect("read response");
-        response
-    }
-
-    #[test]
-    fn upload_streams_in_64kib_chunks_and_renames_atomically() {
-        let dir = test_dest_dir();
-        let listener = TcpListener::bind("127.0.0.1:0").expect("bind listener");
-        let addr = listener.local_addr().expect("local addr");
-        let token = "uptest";
-        let state = Arc::new(Mutex::new(SessionState::default()));
-
-        // Larger than one 64 KiB chunk to exercise the chunked read loop.
-        let body: Vec<u8> = (0..100_000).map(|i| (i % 251) as u8).collect();
-        let content_length = Some(body.len());
-        let expected = body.clone();
-
-        let client = std::thread::spawn(move || upload_client(addr, token, "video.bin", &body));
-
-        let (mut stream, body_bytes) = accept_upload(&listener);
-        let result = serve_upload(
-            &mut stream,
-            &format!("/{}/upload?name=video.bin", token),
-            &state,
-            &dir,
-            &body_bytes,
-            content_length,
-            None,
-        );
-        assert!(result.is_ok(), "serve_upload should succeed");
-        drop(stream); // EOF for the client, so read_to_end returns.
-
-        let response = client.join().expect("client joined");
-        assert!(response.starts_with(b"HTTP/1.1 200"), "unexpected: {:?}", String::from_utf8_lossy(&response));
-        assert!(
-            String::from_utf8_lossy(&response).contains("{\"ok\":true}"),
-            "unexpected: {:?}",
-            String::from_utf8_lossy(&response)
+        let paths = vec![
+            std::path::PathBuf::from("/tmp/a.txt"),
+            std::path::PathBuf::from("/tmp/b.txt"),
+        ];
+        session.configure_send(
+            paths.clone(),
+            true,
+            Some(5),
+            Some(30),
+            "http://example.com".to_string(),
         );
 
-        let final_path = dir.join("video.bin");
-        let part_path = dir.join(".video.bin.lanbeam.part");
-        assert!(final_path.is_file(), "final file should exist after atomic rename");
-        assert!(!part_path.exists(), "part file should be gone after rename");
-        assert_eq!(fs::read(&final_path).unwrap(), expected, "uploaded bytes must match");
-        assert_eq!(state.lock().unwrap().uploads_received, 1);
+        let st = lock_state(&session.state);
+        assert_eq!(st.mode, "send");
+        assert_eq!(st.files.len(), 2);
+        assert_eq!(st.shared_paths.len(), 2);
+        assert!(st.once);
+        assert_eq!(st.max_downloads, Some(5));
+        assert_eq!(st.timeout_secs, Some(30));
+        assert_eq!(st.url, "http://example.com");
     }
 
     #[test]
-    fn upload_deduplicates_repeated_names() {
-        let dir = test_dest_dir();
-        let listener = TcpListener::bind("127.0.0.1:0").expect("bind listener");
-        let addr = listener.local_addr().expect("local addr");
-        let token = "uptest2";
-        let state = Arc::new(Mutex::new(SessionState::default()));
+    fn configure_receive_sets_state() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let session = ServerSession::new(listener, port, "token123").unwrap();
 
-        for expected in ["note.txt", "note_1.txt", "note_2.txt"] {
-            let client = std::thread::spawn({
-                let addr = addr;
-                let token = token.to_string();
-                move || upload_client(addr, &token, "note.txt", b"hello")
-            });
+        session.configure_receive(
+            std::path::PathBuf::from("/tmp/recv"),
+            Some(10),
+            Some(60),
+            "http://example.com".to_string(),
+        );
 
-            let (mut stream, body_bytes) = accept_upload(&listener);
-            serve_upload(
-                &mut stream,
-                &format!("/{}/upload?name=note.txt", token),
-                &state,
-                &dir,
-                &body_bytes,
-                Some(5),
-                None,
-            )
-            .expect("serve upload");
-            drop(stream); // EOF for the client.
-
-            client.join().expect("client joined");
-            assert!(dir.join(expected).is_file(), "expected {}", expected);
-        }
-        assert_eq!(state.lock().unwrap().uploads_received, 3);
+        let st = lock_state(&session.state);
+        assert_eq!(st.mode, "receive");
+        assert_eq!(st.dest_dir, std::path::PathBuf::from("/tmp/recv"));
+        assert_eq!(st.max_uploads, Some(10));
+        assert_eq!(st.timeout_secs, Some(60));
+        assert_eq!(st.url, "http://example.com");
     }
 
     #[test]
-    fn upload_sanitizes_filename_from_query() {
-        let dir = test_dest_dir();
-        let listener = TcpListener::bind("127.0.0.1:0").expect("bind listener");
-        let addr = listener.local_addr().expect("local addr");
-        let token = "uptest3";
-        let state = Arc::new(Mutex::new(SessionState::default()));
+    fn configure_text_sets_state() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let session = ServerSession::new(listener, port, "token123").unwrap();
 
-        let client = std::thread::spawn(move || {
-            upload_client(addr, token, "../../../evil.sh", b"nope")
-        });
+        session.configure_text(
+            Some("hello".to_string()),
+            true,
+            Some(30),
+            "http://example.com".to_string(),
+        );
 
-        let (mut stream, body_bytes) = accept_upload(&listener);
-        serve_upload(
-            &mut stream,
-            &format!("/{}/upload?name=../../../evil.sh", token),
-            &state,
-            &dir,
-            &body_bytes,
-            Some(4),
-            None,
-        )
-        .expect("serve upload");
-        drop(stream); // EOF for the client.
-
-        client.join().expect("client joined");
-        assert!(dir.join("evil.sh").is_file(), "sanitized basename should be used");
-        assert!(!dir.join("evil.sh.lanbeam.part").exists(), "no stray .part file");
-        assert!(!dir.join("..").join("evil.sh").exists(), "no path traversal");
-    }
-
-    // --- stop ---
-
-    #[test]
-    fn stop_terminates_listener_loop() {
-        let listener = TcpListener::bind("127.0.0.1:0").expect("bind listener");
-        let port = listener.local_addr().expect("local addr").port();
-        let session = ServerSession::new(listener, port, "tok").expect("new session");
-        session.stop();
-        // `active` is false, so `run` should exit on the first WouldBlock poll.
-        assert!(session.run().is_ok(), "run should return Ok after stop");
+        let st = lock_state(&session.state);
+        assert_eq!(st.mode, "text");
+        assert_eq!(st.shared_text, Some("hello".to_string()));
+        assert!(st.once);
+        assert_eq!(st.timeout_secs, Some(30));
+        assert_eq!(st.url, "http://example.com");
     }
 
     #[test]
-    fn stop_endpoint_response() {
-        // `POST /<token>/stop` is handled inline in `handle_connection`: it
-        // deactivates the session and replies 200. Exercise the state flip
-        // directly through `ServerSession::stop`.
-        let listener = TcpListener::bind("127.0.0.1:0").expect("bind listener");
-        let port = listener.local_addr().expect("local addr").port();
-        let session = ServerSession::new(listener, port, "tok").expect("new session");
-        assert!(session.state.lock().unwrap().active);
-        session.stop();
-        assert!(!session.state.lock().unwrap().active);
-    }
-
-    // --- download ---
-
-    /// Helper to create a test file and return its path and content.
-    fn create_test_file(dir: &Path, name: &str, content: &[u8]) -> PathBuf {
-        let path = dir.join(name);
-        fs::write(&path, content).expect("write test file");
-        path
-    }
-
-    /// Accept one connection and consume its request headers (mirroring
-    /// `handle_connection`), returning the stream.
-    fn accept_download(listener: &TcpListener) -> TcpStream {
-        let (mut stream, _) = listener.accept().expect("accept");
-        stream.set_nonblocking(false).expect("blocking stream");
-        let mut buf = Vec::new();
-        let mut tmp = [0u8; 4096];
-        loop {
-            let n = stream.read(&mut tmp).expect("read request headers");
-            assert!(n > 0, "client disconnected before sending headers");
-            buf.extend_from_slice(&tmp[..n]);
-            if buf.windows(4).any(|w| w == b"\r\n\r\n") {
-                break;
-            }
-        }
-        stream
-    }
-
-    /// Helper to perform a download request and return response.
-    fn download_request(
-        addr: SocketAddr,
-        token: &str,
-        index: usize,
-        range: Option<&str>,
-    ) -> (u16, Vec<u8>, Vec<u8>) {
-        let mut stream = TcpStream::connect(addr).expect("connect download client");
-        let range_header = range.map(|r| format!("range: {}\r\n", r)).unwrap_or_default();
-        let mut request = String::new();
-        request.push_str(&format!("GET /{}/download/{}/test.txt HTTP/1.1\r\n", token, index));
-        request.push_str("host: localhost\r\n");
-        request.push_str(&range_header);
-        request.push_str("connection: close\r\n\r\n");
-        stream.write_all(request.as_bytes()).expect("write request");
-        let mut response = Vec::new();
-        stream.read_to_end(&mut response).expect("read response");
-        
-        // Parse status line.
-        let status_line_end = response.windows(2).position(|w| w == b"\r\n").unwrap_or(0);
-        let status_line = String::from_utf8_lossy(&response[..status_line_end]);
-        let status_code = status_line.split_whitespace().nth(1).unwrap_or("0").parse().unwrap_or(0);
-        
-        // Find body start.
-        let body_start = response.windows(4).position(|w| w == b"\r\n\r\n").map(|i| i + 4).unwrap_or(response.len());
-        let headers = &response[..body_start];
-        let body = &response[body_start..];
-        
-        (status_code, headers.to_vec(), body.to_vec())
-    }
-
-    /// Decode HTTP chunked transfer encoding.
-    fn decode_chunked(data: &[u8]) -> Vec<u8> {
-        let mut result = Vec::new();
-        let mut pos = 0;
-        while pos < data.len() {
-            // Find end of chunk size line.
-            let Some(line_end) = data[pos..].windows(2).position(|w| w == b"\r\n") else {
-                break;
-            };
-            let line_end = pos + line_end;
-            let size_line = &data[pos..line_end];
-            let size = usize::from_str_radix(std::str::from_utf8(size_line).unwrap_or("0"), 16).unwrap_or(0);
-            if size == 0 {
-                break;
-            }
-            let chunk_start = line_end + 2; // skip \r\n
-            if chunk_start + size > data.len() {
-                break;
-            }
-            result.extend_from_slice(&data[chunk_start..chunk_start + size]);
-            pos = chunk_start + size + 2; // skip chunk data and \r\n
-        }
-        result
+    fn token_routing_root_returns_403() {
+        let (token, port, handle, _state) = start_test_server();
+        let (status, _) = http_get(port, "/");
+        assert_eq!(status, 403);
+        let (status, _) = http_get(port, "/wrong");
+        assert_eq!(status, 403);
+        let (status, _) = http_get(port, "/wrong/status");
+        assert_eq!(status, 403);
+        let (status, _) = http_get(port, &format!("/{}extra", token));
+        assert_eq!(status, 403);
+        lock_state(&_state).active = false;
+        handle.join().ok();
     }
 
     #[test]
-    fn download_serves_file_content() {
-        let dir = test_dest_dir();
-        let file_path = create_test_file(&dir, "test.txt", b"Hello, lanbeam download!");
-        let listener = TcpListener::bind("127.0.0.1:0").expect("bind listener");
-        let addr = listener.local_addr().expect("local addr");
-        let token = "dwntest";
-        let state = Arc::new(Mutex::new(SessionState::default()));
-        let share_paths = vec![file_path];
-
-        let client = std::thread::spawn(move || download_request(addr, token, 0, None));
-
-        let mut stream = accept_download(&listener);
-        serve_download(
-            &mut stream,
-            &format!("/{}/download/0/test.txt", token),
-            &state,
-            &share_paths,
-            false,
-            None,
-            None,
-        )
-        .expect("serve download");
-        drop(stream);
-
-        let (status, _headers, body) = client.join().expect("client joined");
+    fn token_routing_valid_paths_allowed() {
+        let (token, port, handle, _state) = start_test_server();
+        let (status, _) = http_get(port, &format!("/{}", token));
         assert_eq!(status, 200);
-        assert_eq!(body, b"Hello, lanbeam download!");
-        assert_eq!(state.lock().unwrap().downloads_completed, 1);
+        let (status, _) = http_get(port, &format!("/{}/", token));
+        assert_eq!(status, 200);
+        let (status, _) = http_get(port, &format!("/{}/status", token));
+        assert_eq!(status, 200);
+        let (status, _) = http_get(port, &format!("/{}/qr.svg", token));
+        assert_eq!(status, 200);
+        lock_state(&_state).active = false;
+        handle.join().ok();
     }
 
     #[test]
-    fn download_supports_range_header() {
-        let dir = test_dest_dir();
-        let content = b"0123456789ABCDEF";
-        let file_path = create_test_file(&dir, "test.txt", content);
-        let listener = TcpListener::bind("127.0.0.1:0").expect("bind listener");
-        let addr = listener.local_addr().expect("local addr");
-        let token = "dwntest2";
-        let state = Arc::new(Mutex::new(SessionState::default()));
-        let share_paths = vec![file_path];
+    fn serve_qr_encodes_session_url() {
+        let (token, port, handle, state) = start_test_server();
 
-        // Request bytes 5-10 (inclusive).
-        let client = std::thread::spawn(move || download_request(addr, token, 0, Some("bytes=5-10")));
+        // Set session URL
+        {
+            let mut st = lock_state(&state);
+            st.url = format!("http://192.168.1.5:5000/{}", token);
+        }
 
-        let mut stream = accept_download(&listener);
-        serve_download(
-            &mut stream,
+        let (status, body) = http_get(port, &format!("/{}/qr.svg", token));
+        assert_eq!(status, 200);
+        let svg = String::from_utf8(body).unwrap();
+        // QR is a visual encoding - verify it's valid SVG with QR structure
+        assert!(svg.starts_with("<svg"));
+        assert!(svg.contains("<rect"));
+        assert!(svg.trim_end().ends_with("</svg>"));
+        // The URL is encoded visually in the QR, not as plain text
+
+        lock_state(&state).active = false;
+        handle.join().ok();
+    }
+
+    #[test]
+    fn serve_app_injects_initial_state() {
+        let (token, port, handle, state) = start_test_server();
+
+        {
+            let mut st = lock_state(&state);
+            st.url = format!("http://192.168.1.5:5000/{}", token);
+            st.mode = "send".to_string();
+            st.files = vec!["test.txt".to_string()];
+            st.downloads_completed = 0;
+            st.uploads_received = 0;
+            st.shared_text = Some("hello</script>\nthere".to_string());
+            st.remaining_seconds = 300;
+            st.active = true;
+        }
+
+        let (status, body) = http_get(port, &format!("/{}", token));
+        assert_eq!(status, 200);
+        let html = String::from_utf8(body).unwrap();
+        // Should contain the initial state injection
+        assert!(html.contains("__LANBEAM_INITIAL_STATE__"));
+        assert!(html.contains(&format!("\"token\":\"{}\"", token)));
+        assert!(html.contains("send"));
+        assert!(html.contains("test.txt"));
+        assert!(html.contains("hello\\u003c/script>\\nthere"));
+        assert!(html.contains("300"));
+        assert!(html.contains("true"));
+
+        lock_state(&state).active = false;
+        handle.join().ok();
+    }
+
+    #[test]
+    fn serve_download_full_file() {
+        let (token, port, handle, state) = start_test_server();
+
+        let tmp_dir = unique_temp_dir("lanbeam_test");
+        std::fs::create_dir_all(&tmp_dir).unwrap();
+        let _guard = TempDirGuard(tmp_dir.clone());
+
+        let file_path = tmp_dir.join("test.txt");
+        std::fs::write(&file_path, b"Hello, world!").unwrap();
+
+        {
+            let mut st = lock_state(&state);
+            st.shared_paths = vec![file_path.clone()];
+            st.files = vec!["test.txt".to_string()];
+            st.mode = "send".to_string();
+        }
+
+        let (status, body) = http_get(port, &format!("/{}/download/0/test.txt", token));
+        assert_eq!(status, 200);
+        assert_eq!(body, b"Hello, world!");
+
+        {
+            let st = lock_state(&state);
+            assert_eq!(st.downloads_completed, 1);
+        }
+        lock_state(&state).active = false;
+        handle.join().ok();
+    }
+
+    #[test]
+    fn serve_download_range_partial_content() {
+        let (token, port, handle, state) = start_test_server();
+
+        let tmp_dir = unique_temp_dir("lanbeam_test");
+        std::fs::create_dir_all(&tmp_dir).unwrap();
+        let _guard = TempDirGuard(tmp_dir.clone());
+
+        let file_path = tmp_dir.join("test.txt");
+        std::fs::write(&file_path, b"0123456789ABCDEF").unwrap(); // 16 bytes
+
+        {
+            let mut st = lock_state(&state);
+            st.shared_paths = vec![file_path.clone()];
+            st.files = vec!["test.txt".to_string()];
+            st.mode = "send".to_string();
+        }
+
+        let (status, body, cr) = http_get_with_range(
+            port,
             &format!("/{}/download/0/test.txt", token),
-            &state,
-            &share_paths,
-            false,
-            None,
-            Some("bytes=5-10".to_string()),
-        )
-        .expect("serve download");
-        drop(stream);
-
-        let (status, headers, body) = client.join().expect("client joined");
+            "bytes=0-9",
+        );
         assert_eq!(status, 206);
-        assert_eq!(body, b"56789A");
-        let headers_str = String::from_utf8_lossy(&headers);
-        assert!(headers_str.contains("Content-Range: bytes 5-10/16"));
-        assert!(headers_str.contains("Accept-Ranges: bytes"));
+        assert_eq!(body, b"0123456789");
+        assert!(cr.contains("bytes 0-9/16"));
+
+        {
+            let st = lock_state(&state);
+            assert_eq!(st.downloads_completed, 1);
+        }
+        lock_state(&state).active = false;
+        handle.join().ok();
     }
 
     #[test]
-    fn download_supports_suffix_range() {
-        let dir = test_dest_dir();
-        let content = b"0123456789ABCDEF";
-        let file_path = create_test_file(&dir, "test.txt", content);
-        let listener = TcpListener::bind("127.0.0.1:0").expect("bind listener");
-        let addr = listener.local_addr().expect("local addr");
-        let token = "dwntest3";
-        let state = Arc::new(Mutex::new(SessionState::default()));
-        let share_paths = vec![file_path];
+    fn serve_download_range_suffix() {
+        let (token, port, handle, state) = start_test_server();
 
-        // Request last 5 bytes.
-        let client = std::thread::spawn(move || download_request(addr, token, 0, Some("bytes=-5")));
+        let tmp_dir = unique_temp_dir("lanbeam_test");
+        std::fs::create_dir_all(&tmp_dir).unwrap();
+        let _guard = TempDirGuard(tmp_dir.clone());
 
-        let mut stream = accept_download(&listener);
-        serve_download(
-            &mut stream,
-            &format!("/{}/download/0/test.txt", token),
-            &state,
-            &share_paths,
-            false,
-            None,
-            Some("bytes=-5".to_string()),
-        )
-        .expect("serve download");
-        drop(stream);
+        let file_path = tmp_dir.join("test.txt");
+        std::fs::write(&file_path, b"0123456789ABCDEF").unwrap(); // 16 bytes
 
-        let (status, _headers, body) = client.join().expect("client joined");
-        assert_eq!(status, 206);
-        assert_eq!(body, b"BCDEF");
-    }
+        {
+            let mut st = lock_state(&state);
+            st.shared_paths = vec![file_path.clone()];
+            st.files = vec!["test.txt".to_string()];
+            st.mode = "send".to_string();
+        }
 
-    #[test]
-    fn download_supports_open_ended_range() {
-        let dir = test_dest_dir();
-        let content = b"0123456789ABCDEF";
-        let file_path = create_test_file(&dir, "test.txt", content);
-        let listener = TcpListener::bind("127.0.0.1:0").expect("bind listener");
-        let addr = listener.local_addr().expect("local addr");
-        let token = "dwntest4";
-        let state = Arc::new(Mutex::new(SessionState::default()));
-        let share_paths = vec![file_path];
-
-        // Request from byte 10 to end.
-        let client = std::thread::spawn(move || download_request(addr, token, 0, Some("bytes=10-")));
-
-        let mut stream = accept_download(&listener);
-        serve_download(
-            &mut stream,
-            &format!("/{}/download/0/test.txt", token),
-            &state,
-            &share_paths,
-            false,
-            None,
-            Some("bytes=10-".to_string()),
-        )
-        .expect("serve download");
-        drop(stream);
-
-        let (status, _headers, body) = client.join().expect("client joined");
+        let (status, body, cr) =
+            http_get_with_range(port, &format!("/{}/download/0/test.txt", token), "bytes=-6");
         assert_eq!(status, 206);
         assert_eq!(body, b"ABCDEF");
+        assert!(cr.contains("bytes 10-15/16"));
+
+        {
+            let st = lock_state(&state);
+            assert_eq!(st.downloads_completed, 1);
+        }
+        lock_state(&state).active = false;
+        handle.join().ok();
     }
 
     #[test]
-    fn download_returns_416_for_unsatisfiable_range() {
-        let dir = test_dest_dir();
-        let content = b"0123456789ABCDEF";
-        let file_path = create_test_file(&dir, "test.txt", content);
-        let listener = TcpListener::bind("127.0.0.1:0").expect("bind listener");
-        let addr = listener.local_addr().expect("local addr");
-        let token = "dwntest5";
-        let state = Arc::new(Mutex::new(SessionState::default()));
-        let share_paths = vec![file_path];
+    fn serve_download_empty_file_range_416() {
+        let (token, port, handle, state) = start_test_server();
 
-        // Request bytes beyond file size.
-        let client = std::thread::spawn(move || download_request(addr, token, 0, Some("bytes=100-200")));
+        let tmp_dir = unique_temp_dir("lanbeam_test");
+        std::fs::create_dir_all(&tmp_dir).unwrap();
+        let _guard = TempDirGuard(tmp_dir.clone());
 
-        let mut stream = accept_download(&listener);
-        serve_download(
-            &mut stream,
-            &format!("/{}/download/0/test.txt", token),
-            &state,
-            &share_paths,
-            false,
-            None,
-            Some("bytes=100-200".to_string()),
-        )
-        .expect("serve download");
-        drop(stream);
+        let file_path = tmp_dir.join("empty.txt");
+        std::fs::write(&file_path, b"").unwrap();
 
-        let (status, headers, body) = client.join().expect("client joined");
+        {
+            let mut st = lock_state(&state);
+            st.shared_paths = vec![file_path.clone()];
+            st.files = vec!["empty.txt".to_string()];
+            st.mode = "send".to_string();
+        }
+
+        let (status, _, cr) = http_get_with_range(
+            port,
+            &format!("/{}/download/0/empty.txt", token),
+            "bytes=0-0",
+        );
         assert_eq!(status, 416);
-        assert_eq!(body, b"");
-        let headers_str = String::from_utf8_lossy(&headers);
-        assert!(headers_str.contains("Content-Range: bytes */16"));
+        assert!(cr.contains("bytes */0"));
+
+        lock_state(&state).active = false;
+        handle.join().ok();
     }
 
     #[test]
-    fn download_once_stops_after_first() {
-        let dir = test_dest_dir();
-        let file_path = create_test_file(&dir, "test.txt", b"content");
-        let listener = TcpListener::bind("127.0.0.1:0").expect("bind listener");
-        let addr = listener.local_addr().expect("local addr");
-        let token = "dwntest6";
-        let state = Arc::new(Mutex::new(SessionState::default()));
-        let share_paths = vec![file_path];
+    fn serve_download_invalid_range_416() {
+        let (token, port, handle, state) = start_test_server();
 
-        // First download.
-        let client1 = std::thread::spawn(move || download_request(addr, token, 0, None));
-        let mut stream = accept_download(&listener);
-        serve_download(
-            &mut stream,
+        let tmp_dir = unique_temp_dir("lanbeam_test");
+        std::fs::create_dir_all(&tmp_dir).unwrap();
+        let _guard = TempDirGuard(tmp_dir.clone());
+
+        let file_path = tmp_dir.join("test.txt");
+        std::fs::write(&file_path, b"123").unwrap(); // 3 bytes
+
+        {
+            let mut st = lock_state(&state);
+            st.shared_paths = vec![file_path.clone()];
+            st.files = vec!["test.txt".to_string()];
+            st.mode = "send".to_string();
+        }
+
+        let (status, _, cr) = http_get_with_range(
+            port,
             &format!("/{}/download/0/test.txt", token),
-            &state,
-            &share_paths,
-            true, // once = true
-            None,
-            None,
-        )
-        .expect("serve download");
-        drop(stream);
-        client1.join().expect("client joined");
-        
-        // Session should be deactivated.
-        assert!(!state.lock().unwrap().active);
-        assert_eq!(state.lock().unwrap().downloads_completed, 1);
-    }
-
-    #[test]
-    fn download_max_downloads_stops_after_n() {
-        let dir = test_dest_dir();
-        let file_path = create_test_file(&dir, "test.txt", b"content");
-        let listener = TcpListener::bind("127.0.0.1:0").expect("bind listener");
-        let addr = listener.local_addr().expect("local addr");
-        let token = "dwntest7";
-        let state = Arc::new(Mutex::new(SessionState::default()));
-        let share_paths = vec![file_path];
-
-        // First download - should not stop (max=2).
-        let client1 = std::thread::spawn(move || download_request(addr, token, 0, None));
-        let mut stream = accept_download(&listener);
-        serve_download(
-            &mut stream,
-            &format!("/{}/download/0/test.txt", token),
-            &state,
-            &share_paths,
-            false,
-            Some(2), // max_downloads = 2
-            None,
-        )
-        .expect("serve download");
-        drop(stream);
-        client1.join().expect("client joined");
-        assert!(state.lock().unwrap().active);
-        assert_eq!(state.lock().unwrap().downloads_completed, 1);
-
-        // Second download - should stop (reached max).
-        let client2 = std::thread::spawn(move || download_request(addr, token, 0, None));
-        let mut stream = accept_download(&listener);
-        serve_download(
-            &mut stream,
-            &format!("/{}/download/0/test.txt", token),
-            &state,
-            &share_paths,
-            false,
-            Some(2),
-            None,
-        )
-        .expect("serve download");
-        drop(stream);
-        client2.join().expect("client joined");
-        assert!(!state.lock().unwrap().active);
-        assert_eq!(state.lock().unwrap().downloads_completed, 2);
-    }
-
-    #[test]
-    fn download_returns_404_for_invalid_index() {
-        let dir = test_dest_dir();
-        let file_path = create_test_file(&dir, "test.txt", b"content");
-        let listener = TcpListener::bind("127.0.0.1:0").expect("bind listener");
-        let addr = listener.local_addr().expect("local addr");
-        let token = "dwntest8";
-        let state = Arc::new(Mutex::new(SessionState::default()));
-        let share_paths = vec![file_path];
-
-        let client = std::thread::spawn(move || download_request(addr, token, 5, None));
-        let mut stream = accept_download(&listener);
-        serve_download(
-            &mut stream,
-            &format!("/{}/download/5/test.txt", token),
-            &state,
-            &share_paths,
-            false,
-            None,
-            None,
-        )
-        .expect("serve download");
-        drop(stream);
-
-        let (status, _headers, _body) = client.join().expect("client joined");
-        assert_eq!(status, 404);
-    }
-
-    // --- download-all.zip ---
-
-    #[test]
-    fn download_all_creates_zip_for_multiple_files() {
-        let dir = test_dest_dir();
-        let file1 = create_test_file(&dir, "file1.txt", b"content1");
-        let file2 = create_test_file(&dir, "file2.txt", b"content2");
-        let listener = TcpListener::bind("127.0.0.1:0").expect("bind listener");
-        let addr = listener.local_addr().expect("local addr");
-        let token = "dwntest9";
-        let share_paths = vec![file1, file2];
-
-        let mut stream = TcpStream::connect(addr).expect("connect");
-        let mut request = String::new();
-        request.push_str(&format!("GET /{}/download-all.zip HTTP/1.1\r\n", token));
-        request.push_str("host: localhost\r\n");
-        request.push_str("connection: close\r\n\r\n");
-        stream.write_all(request.as_bytes()).expect("write request");
-
-        let mut server_stream = accept_download(&listener);
-        serve_download_all(&mut server_stream, &share_paths).expect("serve download all");
-        drop(server_stream);
-
-        let mut response = Vec::new();
-        stream.read_to_end(&mut response).expect("read response");
-        let body_start = response
-            .windows(4)
-            .position(|w| w == b"\r\n\r\n")
-            .map(|i| i + 4)
-            .expect("headers");
-        let zip_bytes = decode_chunked(&response[body_start..]);
-        assert!(zip_bytes.starts_with(&crate::zip::ZIP_LOCAL_HEADER_SIG.to_le_bytes()));
-        let zip_str = String::from_utf8_lossy(&zip_bytes);
-        assert!(zip_str.contains("file1.txt"));
-        assert!(zip_str.contains("file2.txt"));
-        assert!(zip_str.contains("content1"));
-        assert!(zip_str.contains("content2"));
-    }
-
-    #[test]
-    fn download_all_creates_zip_for_directory() {
-        let dir = test_dest_dir();
-        let subdir = dir.join("subdir");
-        fs::create_dir(&subdir).expect("create subdir");
-        let _file1 = create_test_file(&dir, "root.txt", b"root");
-        let _file2 = create_test_file(&subdir, "nested.txt", b"nested");
-        let listener = TcpListener::bind("127.0.0.1:0").expect("bind listener");
-        let addr = listener.local_addr().expect("local addr");
-        let token = "dwntest10";
-        let share_paths = vec![dir.clone()];
-
-        let mut stream = TcpStream::connect(addr).expect("connect");
-        let mut request = String::new();
-        request.push_str(&format!("GET /{}/download-all.zip HTTP/1.1\r\n", token));
-        request.push_str("host: localhost\r\n");
-        request.push_str("connection: close\r\n\r\n");
-        stream.write_all(request.as_bytes()).expect("write request");
-
-        let mut server_stream = accept_download(&listener);
-        serve_download_all(&mut server_stream, &share_paths).expect("serve download all");
-        drop(server_stream);
-
-        let mut response = Vec::new();
-        stream.read_to_end(&mut response).expect("read response");
-        let body_start = response
-            .windows(4)
-            .position(|w| w == b"\r\n\r\n")
-            .map(|i| i + 4)
-            .expect("headers");
-        let zip_bytes = decode_chunked(&response[body_start..]);
-        assert!(zip_bytes.starts_with(&crate::zip::ZIP_LOCAL_HEADER_SIG.to_le_bytes()));
-        let zip_str = String::from_utf8_lossy(&zip_bytes);
-        assert!(zip_str.contains("root.txt"));
-        assert!(zip_str.contains("subdir/nested.txt"));
-        assert!(zip_str.contains("root"));
-        assert!(zip_str.contains("nested"));
-    }
-
-    #[test]
-    fn download_all_returns_404_for_empty() {
-        let listener = TcpListener::bind("127.0.0.1:0").expect("bind listener");
-        let addr = listener.local_addr().expect("local addr");
-        let token = "dwntest11";
-        let share_paths = vec![];
-
-        let mut stream = TcpStream::connect(addr).expect("connect");
-        let mut request = String::new();
-        request.push_str(&format!("GET /{}/download-all.zip HTTP/1.1\r\n", token));
-        request.push_str("host: localhost\r\n");
-        request.push_str("connection: close\r\n\r\n");
-        stream.write_all(request.as_bytes()).expect("write request");
-
-        let mut server_stream = accept_download(&listener);
-        let result = serve_download_all(&mut server_stream, &share_paths);
-        assert!(result.is_ok());
-        drop(server_stream);
-
-        let mut response = Vec::new();
-        stream.read_to_end(&mut response).expect("read response");
-        let status_line_end = response.windows(2).position(|w| w == b"\r\n").unwrap_or(0);
-        let status_line = String::from_utf8_lossy(&response[..status_line_end]);
-        let status_code = status_line.split_whitespace().nth(1).unwrap_or("0").parse().unwrap_or(0);
-        assert_eq!(status_code, 404);
-    }
-
-    // --- parse_range_header unit tests ---
-
-    #[test]
-    fn parse_range_header_basic() {
-        assert_eq!(parse_range_header(Some("bytes=0-9".to_string()), 100), Some((0, 9)));
-        assert_eq!(parse_range_header(Some("bytes=10-19".to_string()), 100), Some((10, 19)));
-        assert_eq!(parse_range_header(Some("bytes=50-".to_string()), 100), Some((50, 99)));
-        assert_eq!(parse_range_header(Some("bytes=-10".to_string()), 100), Some((90, 99)));
-    }
-
-    #[test]
-    fn parse_range_header_edge_cases() {
-        // Suffix larger than file.
-        assert_eq!(parse_range_header(Some("bytes=-200".to_string()), 100), Some((0, 99)));
-        // Exact file size.
-        assert_eq!(parse_range_header(Some("bytes=0-99".to_string()), 100), Some((0, 99)));
-        // Single byte.
-        assert_eq!(parse_range_header(Some("bytes=50-50".to_string()), 100), Some((50, 50)));
-    }
-
-    #[test]
-    fn parse_range_header_invalid() {
-        assert_eq!(parse_range_header(None, 100), None);
-        assert_eq!(parse_range_header(Some("invalid".to_string()), 100), None);
-        assert_eq!(parse_range_header(Some("bytes=".to_string()), 100), None);
-        assert_eq!(parse_range_header(Some("bytes=abc-def".to_string()), 100), None);
-        assert_eq!(parse_range_header(Some("bytes=-0".to_string()), 100), None);
-    }
-
-    // --- end-to-end routing & security tests ---
-
-    fn send_raw_http(addr: SocketAddr, request: &[u8]) -> (u16, String) {
-        let mut stream = TcpStream::connect(addr).expect("connect");
-        stream.write_all(request).expect("write request");
-        let mut response = Vec::new();
-        stream.read_to_end(&mut response).expect("read response");
-        let text = String::from_utf8_lossy(&response).into_owned();
-        let status_code = text
-            .lines()
-            .next()
-            .and_then(|l| l.split_whitespace().nth(1))
-            .and_then(|c| c.parse::<u16>().ok())
-            .unwrap_or(0);
-        (status_code, text)
-    }
-
-    #[test]
-    fn route_upload_with_query_param_and_max_uploads_end_to_end() {
-        let dir = test_dest_dir();
-        let listener = TcpListener::bind("127.0.0.1:0").expect("bind listener");
-        let addr = listener.local_addr().expect("local addr");
-        let port = addr.port();
-        let token = "secTok123";
-        let session = ServerSession::new(listener, port, token)
-            .expect("session")
-            .with_dest(dir.clone())
-            .with_max_uploads(Some(2));
-        let state = session.state.clone();
-        let server_thread = thread::spawn(move || session.run());
-
-        // First upload with percent-encoded space and query string.
-        let req1 = format!(
-            "POST /{token}/upload?name=photo%201.jpg HTTP/1.1\r\nHost: localhost\r\nContent-Length: 5\r\nConnection: close\r\n\r\nhello"
+            "bytes=5-10",
         );
-        let (s1, body1) = send_raw_http(addr, req1.as_bytes());
-        assert_eq!(s1, 200, "response: {body1}");
-        assert!(dir.join("photo 1.jpg").is_file());
+        assert_eq!(status, 416);
+        assert!(cr.contains("bytes */3"));
+
+        lock_state(&state).active = false;
+        handle.join().ok();
+    }
+
+    #[test]
+    fn serve_download_subdirectory() {
+        let (token, port, handle, state) = start_test_server();
+
+        let tmp_dir = unique_temp_dir("lanbeam_test");
+        std::fs::create_dir_all(&tmp_dir).unwrap();
+        let _guard = TempDirGuard(tmp_dir.clone());
+
+        let sub_dir = tmp_dir.join("sub");
+        std::fs::create_dir(&sub_dir).unwrap();
+        let file_path = sub_dir.join("file.txt");
+        std::fs::write(&file_path, b"sub file").unwrap();
+
+        {
+            let mut st = lock_state(&state);
+            st.shared_paths = vec![tmp_dir.clone()];
+            st.files = vec!["sub/file.txt".to_string()];
+            st.mode = "send".to_string();
+        }
+
+        let (status, body) = http_get(port, &format!("/{}/download/0/sub/file.txt", token));
+        assert_eq!(status, 200);
+        assert_eq!(body, b"sub file");
+
+        {
+            let st = lock_state(&state);
+            assert_eq!(st.downloads_completed, 1);
+        }
+        lock_state(&state).active = false;
+        handle.join().ok();
+    }
+
+    #[test]
+    fn serve_download_symlink_escape_403() {
+        let (token, port, handle, state) = start_test_server();
+
+        let tmp_dir = unique_temp_dir("lanbeam_test");
+        std::fs::create_dir_all(&tmp_dir).unwrap();
+        let _guard = TempDirGuard(tmp_dir.clone());
+
+        // Create a file outside the shared directory
+        let outside_dir = unique_temp_dir("lanbeam_outside");
+        std::fs::create_dir_all(&outside_dir).unwrap();
+        let _outside_guard = TempDirGuard(outside_dir.clone());
+        let secret_file = outside_dir.join("secret.txt");
+        std::fs::write(&secret_file, b"secret").unwrap();
+
+        // Create symlink inside shared dir pointing outside
+        let link_path = tmp_dir.join("escape.txt");
+        symlink(&secret_file, &link_path).unwrap();
+
+        {
+            let mut st = lock_state(&state);
+            st.shared_paths = vec![tmp_dir.clone()];
+            st.files = vec!["escape.txt".to_string()];
+            st.mode = "send".to_string();
+        }
+
+        let (status, _) = http_get(port, &format!("/{}/download/0/escape.txt", token));
+        assert_eq!(status, 403);
+
+        lock_state(&state).active = false;
+        handle.join().ok();
+    }
+
+    #[test]
+    fn serve_download_once_triggers_shutdown() {
+        let (token, port, handle, state) = start_test_server();
+
+        let tmp_dir = unique_temp_dir("lanbeam_test");
+        std::fs::create_dir_all(&tmp_dir).unwrap();
+        let _guard = TempDirGuard(tmp_dir.clone());
+
+        let file_path = tmp_dir.join("test.txt");
+        std::fs::write(&file_path, b"test").unwrap();
+
+        {
+            let mut st = lock_state(&state);
+            st.shared_paths = vec![file_path.clone()];
+            st.files = vec!["test.txt".to_string()];
+            st.mode = "send".to_string();
+            st.once = true;
+        }
+
+        let (status, _) = http_get(port, &format!("/{}/download/0/test.txt", token));
+        assert_eq!(status, 200);
+
+        {
+            let st = lock_state(&state);
+            assert!(!st.active);
+        }
+        handle.join().ok();
+    }
+
+    #[test]
+    fn serve_download_max_downloads_triggers_shutdown() {
+        let (token, port, handle, state) = start_test_server();
+
+        let tmp_dir = unique_temp_dir("lanbeam_test");
+        std::fs::create_dir_all(&tmp_dir).unwrap();
+        let _guard = TempDirGuard(tmp_dir.clone());
+
+        let file_path = tmp_dir.join("test.txt");
+        std::fs::write(&file_path, b"test").unwrap();
+
+        {
+            let mut st = lock_state(&state);
+            st.shared_paths = vec![file_path.clone()];
+            st.files = vec!["test.txt".to_string()];
+            st.mode = "send".to_string();
+            st.max_downloads = Some(2);
+        }
+
+        // First download
+        let (status, _) = http_get(port, &format!("/{}/download/0/test.txt", token));
+        assert_eq!(status, 200);
+        {
+            let st = lock_state(&state);
+            assert!(st.active);
+        }
+
+        // Second download
+        let (status, _) = http_get(port, &format!("/{}/download/0/test.txt", token));
+        assert_eq!(status, 200);
+        {
+            let st = lock_state(&state);
+            assert!(!st.active);
+            assert_eq!(st.downloads_completed, 2);
+        }
+        handle.join().ok();
+    }
+
+    #[test]
+    fn serve_download_all_streams_zip() {
+        let (token, port, handle, state) = start_test_server();
+
+        let tmp_dir = unique_temp_dir("lanbeam_test");
+        std::fs::create_dir_all(&tmp_dir).unwrap();
+        let _guard = TempDirGuard(tmp_dir.clone());
+
+        let file1 = tmp_dir.join("a.txt");
+        std::fs::write(&file1, b"content a").unwrap();
+
+        let file2 = tmp_dir.join("b.txt");
+        std::fs::write(&file2, b"content b").unwrap();
+
+        // Add a symlink (should be skipped)
+        let link_path = tmp_dir.join("link.txt");
+        symlink(&file1, &link_path).unwrap();
+
+        {
+            let mut st = lock_state(&state);
+            st.shared_paths = vec![tmp_dir.clone()];
+            st.files = vec!["a.txt".to_string(), "b.txt".to_string()];
+            st.mode = "send".to_string();
+        }
+
+        let (status, body) = http_get(port, &format!("/{}/download-all.zip", token));
+        assert_eq!(status, 200);
+        assert!(body.len() > 0);
+        // Check it's a valid ZIP
+        assert!(body.starts_with(&crate::zip::ZIP_LOCAL_HEADER_SIG.to_le_bytes()));
+        let eocd_start = body.len() - 22;
+        assert!(body[eocd_start..].starts_with(&crate::zip::ZIP_END_CENTRAL_DIR_SIG.to_le_bytes()));
+        // Should have 2 entries (symlink skipped)
+        let eocd = &body[eocd_start..];
+        let total_entries = u16::from_le_bytes([eocd[10], eocd[11]]);
+        assert_eq!(total_entries, 2);
+
+        {
+            let st = lock_state(&state);
+            assert_eq!(st.downloads_completed, 1);
+        }
+        lock_state(&state).active = false;
+        handle.join().ok();
+    }
+
+    #[test]
+    fn percent_decode_valid() {
+        assert_eq!(
+            percent_decode("hello%20world"),
+            Ok("hello world".to_string())
+        );
+        assert_eq!(percent_decode("file%2Etxt"), Ok("file.txt".to_string()));
+        assert_eq!(
+            percent_decode("path%2Fto%2Ffile"),
+            Ok("path/to/file".to_string())
+        );
+        // Valid UTF-8 multi-byte: %C3%A9 = é
+        assert_eq!(percent_decode("%C3%A9"), Ok("é".to_string()));
+        // Raw UTF-8 should pass through
+        assert_eq!(percent_decode("café"), Ok("café".to_string()));
+    }
+
+    #[test]
+    fn percent_decode_invalid() {
+        assert!(percent_decode("hello%2").is_err()); // incomplete
+        assert!(percent_decode("hello%GG").is_err()); // invalid hex
+        assert!(percent_decode("hello%00world").is_err()); // null byte
+        assert!(percent_decode("hello%0Aworld").is_err()); // control char
+        assert!(percent_decode("path\\to\\file").is_err()); // backslash
+                                                            // Invalid UTF-8 sequence: %FF is not valid UTF-8 start
+        assert!(percent_decode("%FF").is_err());
+        // Overlong encoding
+        assert!(percent_decode("%C0%80").is_err());
+    }
+
+    #[test]
+    fn serve_text_missing_content_length_400() {
+        let (token, port, handle, _state) = start_test_server();
+
+        let mut stream = std::net::TcpStream::connect(("127.0.0.1", port)).unwrap();
+        stream
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .unwrap();
+        let body = "{\"text\":\"hello\"}";
+        let req = format!(
+            "POST /{}/text HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/json\r\nConnection: close\r\n\r\n{}",
+            token, body
+        );
+        stream.write_all(req.as_bytes()).unwrap();
+
+        let (status, body, _) = read_response(&mut stream);
+        assert_eq!(status, 400);
+        assert!(String::from_utf8_lossy(&body).contains("Missing Content-Length"));
+
+        lock_state(&_state).active = false;
+        handle.join().ok();
+    }
+
+    #[test]
+    fn serve_text_oversized_content_length_400() {
+        let (token, port, handle, _state) = start_test_server();
+
+        let mut stream = std::net::TcpStream::connect(("127.0.0.1", port)).unwrap();
+        stream
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .unwrap();
+        let oversized_len = 65 * 1024; // 64 KiB + 1 KiB
+                                       // Send only headers with oversized Content-Length, no body
+        let req = format!(
+            "POST /{}/text HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+            token, oversized_len
+        );
+        stream.write_all(req.as_bytes()).unwrap();
+
+        let (status, body, _) = read_response(&mut stream);
+        assert_eq!(status, 400);
+        assert!(String::from_utf8_lossy(&body).contains("exceeds 64 KiB"));
+
+        lock_state(&_state).active = false;
+        handle.join().ok();
+    }
+
+    #[test]
+    fn serve_text_premature_eof_400() {
+        let (token, port, handle, _state) = start_test_server();
+
+        let mut stream = std::net::TcpStream::connect(("127.0.0.1", port)).unwrap();
+        stream
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .unwrap();
+        let body = "{\"text\":\"hello\"}";
+        // Claim Content-Length: 100 but only send shorter body
+        let req = format!(
+            "POST /{}/text HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/json\r\nContent-Length: 100\r\nConnection: close\r\n\r\n{}",
+            token, body
+        );
+        stream.write_all(req.as_bytes()).unwrap();
+        // Shutdown write so server sees EOF on read
+        stream.shutdown(std::net::Shutdown::Write).unwrap();
+
+        let (status, body, _) = read_response(&mut stream);
+        assert_eq!(status, 400);
+        assert!(String::from_utf8_lossy(&body).contains("Premature EOF"));
+
+        lock_state(&_state).active = false;
+        handle.join().ok();
+    }
+
+    #[test]
+    fn serve_text_invalid_utf8_400() {
+        let (token, port, handle, _state) = start_test_server();
+
+        let mut stream = std::net::TcpStream::connect(("127.0.0.1", port)).unwrap();
+        stream
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .unwrap();
+        // Send invalid UTF-8: 0xFF is not valid UTF-8
+        let body = "{\"text\":\"";
+        let invalid_utf8 = [0xFFu8];
+        let req = format!(
+            "POST /{}/text HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+            token,
+            body.len() + invalid_utf8.len() + 1, // +1 for closing quote
+            body
+        );
+        stream.write_all(req.as_bytes()).unwrap();
+        stream.write_all(&invalid_utf8).unwrap();
+        stream.write_all(b"\"}").unwrap();
+
+        let (status, body, _) = read_response(&mut stream);
+        assert_eq!(status, 400);
+        assert!(String::from_utf8_lossy(&body).contains("Invalid UTF-8"));
+
+        lock_state(&_state).active = false;
+        handle.join().ok();
+    }
+
+    #[test]
+    fn serve_text_success() {
+        let (token, port, handle, state) = start_test_server();
+
+        let (status, body) = http_post_text(port, &token, "hello world");
+        assert_eq!(status, 200);
+        assert!(String::from_utf8_lossy(&body).contains("ok"));
+
+        {
+            let st = lock_state(&state);
+            assert_eq!(st.shared_text, Some("hello world".to_string()));
+        }
+        // Drop lock before setting active = false
+        lock_state(&state).active = false;
+        handle.join().ok();
+    }
+
+    #[test]
+    fn concurrent_parallel_uploads_deduplicate_cleanly() {
+        use std::collections::HashSet;
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let token = "testparallelupload";
+        let session = ServerSession::new(listener, port, token).unwrap();
+        let dest_dir = unique_temp_dir("parallel_uploads");
+        std::fs::create_dir_all(&dest_dir).unwrap();
+        let _guard = TempDirGuard(dest_dir.clone());
+        session.configure_receive(
+            dest_dir.clone(),
+            None,
+            None,
+            format!("http://127.0.0.1:{}/{}", port, token),
+        );
+        let handle = thread::spawn(move || {
+            let _ = session.run();
+        });
+        thread::sleep(Duration::from_millis(50));
+
+        let payloads: Vec<Vec<u8>> = (0..6)
+            .map(|i| format!("parallel payload {i}").into_bytes())
+            .collect();
+        let joins: Vec<_> = payloads
+            .iter()
+            .cloned()
+            .map(|payload| {
+                thread::spawn(move || {
+                    let mut stream = TcpStream::connect(("127.0.0.1", port)).unwrap();
+                    stream
+                        .set_read_timeout(Some(Duration::from_secs(5)))
+                        .unwrap();
+                    let headers = format!(
+                        "POST /{}/upload?name=same.txt HTTP/1.1\r\nHost: localhost\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                        token,
+                        payload.len()
+                    );
+                    stream.write_all(headers.as_bytes()).unwrap();
+                    stream.write_all(&payload).unwrap();
+                    let (status, _, _) = read_response(&mut stream);
+                    status
+                })
+            })
+            .collect();
+        for join in joins {
+            assert_eq!(join.join().unwrap(), 200);
+        }
+
+        let mut actual_names: HashSet<String> = HashSet::new();
+        let mut actual_payloads: HashSet<Vec<u8>> = HashSet::new();
+        for entry in std::fs::read_dir(&dest_dir).unwrap() {
+            let entry = entry.unwrap();
+            let name = entry.file_name().to_string_lossy().to_string();
+            assert!(
+                !name.ends_with(".lanbeam.part"),
+                "temp part file left behind: {name}"
+            );
+            actual_names.insert(name);
+            actual_payloads.insert(std::fs::read(entry.path()).unwrap());
+        }
+        let expected_names: HashSet<String> = [
+            "same.txt",
+            "same_1.txt",
+            "same_2.txt",
+            "same_3.txt",
+            "same_4.txt",
+            "same_5.txt",
+        ]
+        .into_iter()
+        .map(String::from)
+        .collect();
+        assert_eq!(actual_names, expected_names);
+        let expected: HashSet<Vec<u8>> = payloads.into_iter().collect();
+        assert_eq!(
+            actual_payloads, expected,
+            "all payloads must survive regardless of upload completion order"
+        );
+
+        // Stop through the authenticated endpoint so the listener thread is joined.
+        let mut stop = TcpStream::connect(("127.0.0.1", port)).unwrap();
+        let req = format!(
+            "POST /{}/stop HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n",
+            token
+        );
+        stop.write_all(req.as_bytes()).unwrap();
+        let _ = read_response(&mut stop);
+        handle.join().unwrap();
+    }
+
+    fn http_post_upload(port: u16, token: &str, name: &str, payload: &[u8]) -> (u16, Vec<u8>) {
+        let mut stream = std::net::TcpStream::connect(("127.0.0.1", port)).unwrap();
+        stream
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .unwrap();
+        let req = format!(
+            "POST /{}/upload?name={} HTTP/1.1\r\nHost: localhost\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+            token,
+            name,
+            payload.len()
+        );
+        stream.write_all(req.as_bytes()).unwrap();
+        stream.write_all(payload).unwrap();
+        let (status, body, _) = read_response(&mut stream);
+        (status, body)
+    }
+
+    #[test]
+    fn upload_integration_and_independent_filenames() {
+        let (token, port, handle, state) = start_test_server();
+        let dest_dir = unique_temp_dir("upload_integ");
+        std::fs::create_dir_all(&dest_dir).unwrap();
+        let _guard = TempDirGuard(dest_dir.clone());
+        {
+            let mut st = lock_state(&state);
+            st.mode = "receive".to_string();
+            st.dest_dir = dest_dir.clone();
+        }
+
+        // First file a.txt -> a.txt
+        let (s1, b1) = http_post_upload(port, &token, "a.txt", b"alpha");
+        assert_eq!(s1, 200);
+        assert!(String::from_utf8_lossy(&b1).contains("\"filename\":\"a.txt\""));
+
+        // Different file b.txt must land as b.txt (NOT b_1.txt)
+        let (s2, b2) = http_post_upload(port, &token, "b.txt", b"beta");
+        assert_eq!(s2, 200);
+        assert!(String::from_utf8_lossy(&b2).contains("\"filename\":\"b.txt\""));
+
+        // Duplicate a.txt must deduplicate to a_1.txt
+        let (s3, b3) = http_post_upload(port, &token, "a.txt", b"alpha2");
+        assert_eq!(s3, 200);
+        assert!(String::from_utf8_lossy(&b3).contains("\"filename\":\"a_1.txt\""));
+
+        assert_eq!(std::fs::read(dest_dir.join("a.txt")).unwrap(), b"alpha");
+        assert_eq!(std::fs::read(dest_dir.join("b.txt")).unwrap(), b"beta");
+        assert_eq!(std::fs::read(dest_dir.join("a_1.txt")).unwrap(), b"alpha2");
+
+        lock_state(&state).active = false;
+        handle.join().ok();
+    }
+
+    #[test]
+    fn upload_rejects_invalid_names_oversized_and_premature_eof() {
+        let (token, port, handle, state) = start_test_server();
+        let dest_dir = unique_temp_dir("upload_reject");
+        std::fs::create_dir_all(&dest_dir).unwrap();
+        let _guard = TempDirGuard(dest_dir.clone());
+        {
+            let mut st = lock_state(&state);
+            st.mode = "receive".to_string();
+            st.dest_dir = dest_dir.clone();
+        }
+
+        // Empty / traversal name -> 400
+        let (s_dotdot, _) = http_post_upload(port, &token, "..", b"x");
+        assert_eq!(s_dotdot, 400);
+        let (s_ctrl, _) = http_post_upload(port, &token, "bad%0A.txt", b"x");
+        assert_eq!(s_ctrl, 400);
+
+        // Oversized (> 10 GiB) headers-only -> 400
+        let mut stream = std::net::TcpStream::connect(("127.0.0.1", port)).unwrap();
+        stream
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .unwrap();
+        let huge = format!(
+            "POST /{}/upload?name=huge.bin HTTP/1.1\r\nHost: localhost\r\nContent-Length: 10737418241\r\nConnection: close\r\n\r\n",
+            token
+        );
+        stream.write_all(huge.as_bytes()).unwrap();
+        let (s_huge, _, _) = read_response(&mut stream);
+        assert_eq!(s_huge, 400);
+
+        // Premature EOF -> 400 and zero leftover files
+        let mut eof_stream = std::net::TcpStream::connect(("127.0.0.1", port)).unwrap();
+        eof_stream
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .unwrap();
+        let partial = format!(
+            "POST /{}/upload?name=cut.bin HTTP/1.1\r\nHost: localhost\r\nContent-Length: 100\r\nConnection: close\r\n\r\nshort",
+            token
+        );
+        eof_stream.write_all(partial.as_bytes()).unwrap();
+        eof_stream.shutdown(std::net::Shutdown::Write).unwrap();
+        let (s_eof, _, _) = read_response(&mut eof_stream);
+        assert_eq!(s_eof, 400);
+        assert_eq!(std::fs::read_dir(&dest_dir).unwrap().count(), 0);
+
+        lock_state(&state).active = false;
+        handle.join().ok();
+    }
+
+    #[test]
+    fn upload_max_uploads_deactivates_and_stop_endpoint_works() {
+        let (token, port, handle, state) = start_test_server();
+        let dest_dir = unique_temp_dir("upload_max");
+        std::fs::create_dir_all(&dest_dir).unwrap();
+        let _guard = TempDirGuard(dest_dir.clone());
+        {
+            let mut st = lock_state(&state);
+            st.mode = "receive".to_string();
+            st.dest_dir = dest_dir;
+            st.max_uploads = Some(2);
+        }
+
+        let (s1, _) = http_post_upload(port, &token, "one.txt", b"1");
+        assert_eq!(s1, 200);
         assert!(lock_state(&state).active);
 
-        // Second upload hits max_uploads=2 and cleanly shuts down the session.
-        let req2 = format!(
-            "POST /{token}/upload?name=photo%201.jpg HTTP/1.1\r\nHost: localhost\r\nContent-Length: 5\r\nConnection: close\r\n\r\nworld"
-        );
-        let (s2, body2) = send_raw_http(addr, req2.as_bytes());
-        assert_eq!(s2, 200, "response: {body2}");
-        assert!(dir.join("photo 1_1.jpg").is_file());
-        assert_eq!(fs::read(dir.join("photo 1.jpg")).unwrap(), b"hello");
-        assert_eq!(fs::read(dir.join("photo 1_1.jpg")).unwrap(), b"world");
-        assert_eq!(lock_state(&state).uploads_received, 2);
-
-        server_thread.join().expect("server thread join").expect("server ok");
+        let (s2, _) = http_post_upload(port, &token, "two.txt", b"2");
+        assert_eq!(s2, 200);
         assert!(!lock_state(&state).active);
-    }
+        handle.join().unwrap();
 
-    #[test]
-    fn route_rejects_root_and_token_prefix_collision_with_403() {
-        let listener = TcpListener::bind("127.0.0.1:0").expect("bind listener");
-        let addr = listener.local_addr().expect("local addr");
-        let port = addr.port();
-        let token = "tokABC";
-        let session = ServerSession::new(listener, port, token).expect("session");
-        let state = session.state.clone();
-        let server_thread = thread::spawn(move || session.run());
-
-        let (s_root, _) = send_raw_http(addr, b"GET / HTTP/1.1\r\nHost: localhost\r\n\r\n");
-        assert_eq!(s_root, 403);
-
-        let (s_prefix, _) = send_raw_http(
-            addr,
-            format!("GET /{token}extra/status HTTP/1.1\r\nHost: localhost\r\n\r\n").as_bytes(),
+        // Verify POST /<token>/stop also shuts down an active session cleanly
+        let (token2, port2, handle2, state2) = start_test_server();
+        let mut stop = std::net::TcpStream::connect(("127.0.0.1", port2)).unwrap();
+        stop.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+        let req = format!(
+            "POST /{}/stop HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n",
+            token2
         );
-        assert_eq!(s_prefix, 403);
-
-        let (s_wrong, _) = send_raw_http(addr, b"GET /wrong/status HTTP/1.1\r\nHost: localhost\r\n\r\n");
-        assert_eq!(s_wrong, 403);
-
-        let (s_stop, _) = send_raw_http(
-            addr,
-            format!("POST /{token}/stop?confirm=1 HTTP/1.1\r\nHost: localhost\r\n\r\n").as_bytes(),
-        );
+        stop.write_all(req.as_bytes()).unwrap();
+        let (s_stop, b_stop, _) = read_response(&mut stop);
         assert_eq!(s_stop, 200);
-
-        server_thread.join().expect("server thread join").expect("server ok");
-        assert!(!lock_state(&state).active);
+        assert_eq!(b_stop, b"Stopping");
+        assert!(!lock_state(&state2).active);
+        handle2.join().unwrap();
     }
 
     #[test]
-    fn upload_incomplete_body_removes_part_and_missing_length_returns_411() {
-        let dir = test_dest_dir();
-        let listener = TcpListener::bind("127.0.0.1:0").expect("bind listener");
-        let addr = listener.local_addr().expect("local addr");
-        let port = addr.port();
-        let token = "upguard";
-        let session = ServerSession::new(listener, port, token)
-            .expect("session")
-            .with_dest(dir.clone());
+    fn configure_send_expands_directories_and_preserves_zip_roots() {
+        let root_dir = unique_temp_dir("send_expand");
+        let sub_dir = root_dir.join("nested");
+        std::fs::create_dir_all(&sub_dir).unwrap();
+        let _guard = TempDirGuard(root_dir.clone());
+
+        std::fs::write(root_dir.join("first.txt"), b"first").unwrap();
+        std::fs::write(sub_dir.join("second.txt"), b"second").unwrap();
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let token = "testdirexpand";
+        let session = ServerSession::new(listener, port, token).unwrap();
+        session.configure_send(
+            vec![root_dir.clone()],
+            false,
+            None,
+            None,
+            format!("http://127.0.0.1:{}/{}", port, token),
+        );
+
         let state = session.state.clone();
-        let server_thread = thread::spawn(move || session.run());
+        let handle = thread::spawn(move || {
+            let _ = session.run();
+        });
+        thread::sleep(Duration::from_millis(50));
 
-        // Missing Content-Length -> 411 Length Required.
-        let (s_411, _) = send_raw_http(
-            addr,
-            format!("POST /{token}/upload?name=no_len.txt HTTP/1.1\r\nHost: localhost\r\n\r\nabc")
-                .as_bytes(),
-        );
-        assert_eq!(s_411, 411);
-        assert!(!dir.join("no_len.txt").exists());
+        {
+            let st = lock_state(&state);
+            assert_eq!(st.files, vec!["first.txt", "nested/second.txt"]);
+            assert_eq!(st.zip_roots, vec![root_dir]);
+        }
 
-        // Short body (Content-Length: 100, only 5 bytes sent) -> 400 and .part deleted.
-        let mut stream = TcpStream::connect(addr).expect("connect");
-        let partial_req = format!(
-            "POST /{token}/upload?name=trunc.bin HTTP/1.1\r\nHost: localhost\r\nContent-Length: 100\r\n\r\n12345"
-        );
-        stream.write_all(partial_req.as_bytes()).expect("write partial");
-        stream.shutdown(std::net::Shutdown::Write).expect("shutdown write");
-        let mut resp = Vec::new();
-        stream.read_to_end(&mut resp).expect("read response");
-        let resp_str = String::from_utf8_lossy(&resp);
-        assert!(resp_str.starts_with("HTTP/1.1 400"), "resp: {resp_str}");
-        assert!(!dir.join("trunc.bin").exists());
-        assert!(!dir.join(".trunc.bin.lanbeam.part").exists());
-        assert_eq!(lock_state(&state).uploads_received, 0);
+        // Both should be downloadable with their relative paths
+        let (s0, b0) = http_get(port, &format!("/{}/download/0/first.txt", token));
+        assert_eq!(s0, 200);
+        assert_eq!(b0, b"first");
 
-        let _ = send_raw_http(
-            addr,
-            format!("POST /{token}/stop HTTP/1.1\r\nHost: localhost\r\n\r\n").as_bytes(),
-        );
-        server_thread.join().expect("server thread join").expect("server ok");
-    }
+        let (s1, b1) = http_get(port, &format!("/{}/download/1/nested/second.txt", token));
+        assert_eq!(s1, 200);
+        assert_eq!(b1, b"second");
 
-    #[cfg(unix)]
-    #[test]
-    fn download_all_skips_symlinks_and_prevents_loop() {
-        use std::os::unix::fs::symlink;
+        // Downloading by basename should also work (unique index)
+        let (s_base1, b_base1) = http_get(port, &format!("/{}/download/1/second.txt", token));
+        assert_eq!(s_base1, 200);
+        assert_eq!(b_base1, b"second");
 
-        let outer = test_dest_dir();
-        let secret = create_test_file(&outer, "secret.txt", b"TOP_SECRET_OUTSIDE");
-        let shared = outer.join("shared");
-        let sub = shared.join("sub");
-        fs::create_dir_all(&sub).expect("create shared/sub");
-        let _real = create_test_file(&shared, "public.txt", b"PUBLIC_OK");
+        let (szip, zip_bytes) = http_get(port, &format!("/{}/download-all.zip", token));
+        assert_eq!(szip, 200);
+        assert!(String::from_utf8_lossy(&zip_bytes).contains("nested/second.txt"));
 
-        // Symlink pointing outside shared dir, plus a directory loop symlink.
-        symlink(&secret, shared.join("leak.txt")).expect("symlink leak");
-        symlink(&shared, sub.join("loop")).expect("symlink loop");
-
-        let listener = TcpListener::bind("127.0.0.1:0").expect("bind listener");
-        let addr = listener.local_addr().expect("local addr");
-        let port = addr.port();
-        let token = "symlk";
-        let session = ServerSession::new(listener, port, token)
-            .expect("session")
-            .with_share_paths(vec![shared]);
-        let server_thread = thread::spawn(move || session.run());
-
-        let req = format!("GET /{token}/download-all.zip HTTP/1.1\r\nHost: localhost\r\n\r\n");
-        let mut stream = TcpStream::connect(addr).expect("connect");
-        stream.write_all(req.as_bytes()).expect("write");
-        let mut response = Vec::new();
-        stream.read_to_end(&mut response).expect("read");
-        let body_start = response
-            .windows(4)
-            .position(|w| w == b"\r\n\r\n")
-            .map(|i| i + 4)
-            .expect("headers");
-        let zip_bytes = decode_chunked(&response[body_start..]);
-        let zip_str = String::from_utf8_lossy(&zip_bytes);
-        assert!(zip_str.contains("public.txt"));
-        assert!(zip_str.contains("PUBLIC_OK"));
-        assert!(!zip_str.contains("leak.txt"));
-        assert!(!zip_str.contains("TOP_SECRET_OUTSIDE"));
-
-        let _ = send_raw_http(
-            addr,
-            format!("POST /{token}/stop HTTP/1.1\r\nHost: localhost\r\n\r\n").as_bytes(),
-        );
-        server_thread.join().expect("server thread join").expect("server ok");
+        lock_state(&state).active = false;
+        handle.join().ok();
     }
 
     #[test]
-    fn partial_range_probe_does_not_trip_once_before_end() {
-        let dir = test_dest_dir();
-        let file_path = create_test_file(&dir, "video.mp4", b"0123456789ABCDEF");
-        let listener = TcpListener::bind("127.0.0.1:0").expect("bind listener");
-        let addr = listener.local_addr().expect("local addr");
-        let token = "rangeonce";
-        let state = Arc::new(Mutex::new(SessionState::default()));
-        let share_paths = vec![file_path];
+    fn configure_send_duplicate_basenames_in_subdirs() {
+        let root_dir = unique_temp_dir("send_dup");
+        let sub_a = root_dir.join("a");
+        let sub_b = root_dir.join("b");
+        std::fs::create_dir_all(&sub_a).unwrap();
+        std::fs::create_dir_all(&sub_b).unwrap();
+        let _guard = TempDirGuard(root_dir.clone());
 
-        // Partial range 0-3 does not reach end of file (byte 15).
-        let client1 = std::thread::spawn(move || download_request(addr, token, 0, Some("bytes=0-3")));
-        let mut stream = accept_download(&listener);
-        serve_download(
-            &mut stream,
-            &format!("/{}/download/0/video.mp4", token),
-            &state,
-            &share_paths,
-            true,
+        std::fs::write(sub_a.join("dup.txt"), b"from a").unwrap();
+        std::fs::write(sub_b.join("dup.txt"), b"from b").unwrap();
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let token = "testdupnames";
+        let session = ServerSession::new(listener, port, token).unwrap();
+        session.configure_send(
+            vec![root_dir.clone()],
+            false,
             None,
-            Some("bytes=0-3".to_string()),
-        )
-        .expect("serve partial");
-        drop(stream);
-        let (s1, _, b1) = client1.join().expect("join1");
-        assert_eq!(s1, 206);
-        assert_eq!(b1, b"0123");
+            None,
+            format!("http://127.0.0.1:{}/{}", port, token),
+        );
+
+        let state = session.state.clone();
+        let handle = thread::spawn(move || {
+            let _ = session.run();
+        });
+        thread::sleep(Duration::from_millis(50));
+
+        {
+            let st = lock_state(&state);
+            assert_eq!(st.files, vec!["a/dup.txt", "b/dup.txt"]);
+            assert_eq!(st.zip_roots, vec![root_dir]);
+        }
+
+        // Both should be downloadable with their relative paths
+        let (s0, b0) = http_get(port, &format!("/{}/download/0/a/dup.txt", token));
+        assert_eq!(s0, 200);
+        assert_eq!(b0, b"from a");
+
+        let (s1, b1) = http_get(port, &format!("/{}/download/1/b/dup.txt", token));
+        assert_eq!(s1, 200);
+        assert_eq!(b1, b"from b");
+
+        // Downloading by basename works because index uniquely selects the file
+        let (s_base0, b_base0) = http_get(port, &format!("/{}/download/0/dup.txt", token));
+        assert_eq!(s_base0, 200);
+        assert_eq!(b_base0, b"from a");
+
+        let (s_base1, b_base1) = http_get(port, &format!("/{}/download/1/dup.txt", token));
+        assert_eq!(s_base1, 200);
+        assert_eq!(b_base1, b"from b");
+
+        // Cross-directory mismatch should fail (wrong subdir prefix for that index)
+        let (s_cross0, _) = http_get(port, &format!("/{}/download/0/b/dup.txt", token));
+        assert_eq!(s_cross0, 404);
+
+        let (s_cross1, _) = http_get(port, &format!("/{}/download/1/a/dup.txt", token));
+        assert_eq!(s_cross1, 404);
+
+        lock_state(&state).active = false;
+        handle.join().ok();
+    }
+
+    #[test]
+    fn serve_text_handles_escaped_quotes_and_newlines() {
+        let (token, port, handle, state) = start_test_server();
+        let (status, _) = http_post_text(port, &token, "hello \\\"quoted\\\"\\nline2\\\\tail");
+        assert_eq!(status, 200);
+
+        {
+            let st = lock_state(&state);
+            assert_eq!(
+                st.shared_text.as_deref(),
+                Some("hello \"quoted\"\nline2\\tail")
+            );
+        }
+
+        let (st_code, st_body) = http_get(port, &format!("/{}/status", token));
+        assert_eq!(st_code, 200);
+        let st_json = String::from_utf8(st_body).unwrap();
+        assert!(st_json.contains(&format!("\"token\":\"{}\"", token)));
+
+        lock_state(&state).active = false;
+        handle.join().ok();
+    }
+
+    fn read_proc_rss_kb() -> (u64, u64) {
+        let status = std::fs::read_to_string("/proc/self/status").unwrap_or_default();
+        let mut rss = 0u64;
+        let mut hwm = 0u64;
+        for line in status.lines() {
+            if let Some(rest) = line.strip_prefix("VmRSS:") {
+                rss = rest
+                    .split_whitespace()
+                    .next()
+                    .and_then(|v| v.parse().ok())
+                    .unwrap_or(0);
+            } else if let Some(rest) = line.strip_prefix("VmHWM:") {
+                hwm = rest
+                    .split_whitespace()
+                    .next()
+                    .and_then(|v| v.parse().ok())
+                    .unwrap_or(0);
+            }
+        }
+        (rss, hwm)
+    }
+
+    fn read_proc_cpu_ticks() -> u64 {
+        let stat = std::fs::read_to_string("/proc/self/stat").unwrap_or_default();
+        if let Some(rparen) = stat.rfind(')') {
+            let fields: Vec<&str> = stat[rparen + 2..].split_whitespace().collect();
+            // After comm+state: index 11 is utime, index 12 is stime (fields[11], fields[12] relative to state at index 0)
+            let utime: u64 = fields.get(11).and_then(|v| v.parse().ok()).unwrap_or(0);
+            let stime: u64 = fields.get(12).and_then(|v| v.parse().ok()).unwrap_or(0);
+            return utime + stime;
+        }
+        0
+    }
+
+    #[test]
+    fn performance_cpu_and_memory_profile() {
+        let work_dir = unique_temp_dir("perf_profile");
+        std::fs::create_dir_all(&work_dir).unwrap();
+        let _guard = TempDirGuard(work_dir.clone());
+
+        // Create 32 MiB test file for streaming download & range tests
+        let big_file = work_dir.join("big32m.bin");
+        {
+            let mut f = std::fs::File::create(&big_file).unwrap();
+            let block = vec![0x5Au8; 1024 * 1024];
+            for _ in 0..32 {
+                f.write_all(&block).unwrap();
+            }
+            f.flush().unwrap();
+        }
+
+        // Create 4 x 4 MiB = 16 MiB directory for streaming ZIP test
+        let zip_dir = work_dir.join("zipsrc");
+        std::fs::create_dir_all(&zip_dir).unwrap();
+        {
+            let block = vec![0xA5u8; 1024 * 1024];
+            for i in 0..4 {
+                let mut f = std::fs::File::create(zip_dir.join(format!("part{i}.bin"))).unwrap();
+                for _ in 0..4 {
+                    f.write_all(&block).unwrap();
+                }
+            }
+        }
+
+        let upload_dir = work_dir.join("uploads");
+        std::fs::create_dir_all(&upload_dir).unwrap();
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let token = "perfprofiletok";
+        let session = ServerSession::new(listener, port, token).unwrap();
+        let state = session.state.clone();
+        session.configure_send(
+            vec![big_file.clone()],
+            false,
+            None,
+            None,
+            format!("http://127.0.0.1:{}/{}", port, token),
+        );
+        let handle = thread::spawn(move || {
+            let _ = session.run();
+        });
+        thread::sleep(Duration::from_millis(50));
+
+        // 1. Idle baseline (200ms)
+        let (rss_base, _) = read_proc_rss_kb();
+        let ticks_0 = read_proc_cpu_ticks();
+        thread::sleep(Duration::from_millis(200));
+        let ticks_idle = read_proc_cpu_ticks().saturating_sub(ticks_0);
+
+        // 2. 32 MiB streaming download (client streams in 64 KiB buffer without 32 MiB allocation)
+        let t_dl_start = Instant::now();
+        let ticks_dl_0 = read_proc_cpu_ticks();
+        let (rss_dl_before, _) = read_proc_rss_kb();
+        let mut dl_stream = std::net::TcpStream::connect(("127.0.0.1", port)).unwrap();
+        dl_stream
+            .set_read_timeout(Some(Duration::from_secs(10)))
+            .unwrap();
+        let req = format!(
+            "GET /{}/download/0/big32m.bin HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n",
+            token
+        );
+        dl_stream.write_all(req.as_bytes()).unwrap();
+        let mut rbuf = [0u8; 64 * 1024];
+        let mut total_rx = 0usize;
+        let mut header_skipped = false;
+        let mut hdr_acc = Vec::new();
+        let mut rss_dl_peak = rss_dl_before;
+        loop {
+            let n = dl_stream.read(&mut rbuf).unwrap();
+            if n == 0 {
+                break;
+            }
+            if !header_skipped {
+                hdr_acc.extend_from_slice(&rbuf[..n]);
+                if let Some(pos) = hdr_acc.windows(4).position(|w| w == b"\r\n\r\n") {
+                    total_rx += hdr_acc.len() - (pos + 4);
+                    header_skipped = true;
+                }
+            } else {
+                total_rx += n;
+            }
+            let (cur_rss, _) = read_proc_rss_kb();
+            if cur_rss > rss_dl_peak {
+                rss_dl_peak = cur_rss;
+            }
+        }
+        let dl_elapsed = t_dl_start.elapsed();
+        let ticks_dl = read_proc_cpu_ticks().saturating_sub(ticks_dl_0);
+        assert_eq!(total_rx, 32 * 1024 * 1024);
+        assert!(
+            rss_dl_peak.saturating_sub(rss_dl_before) < 8192,
+            "streaming download RSS grew too much: {} KiB -> {} KiB",
+            rss_dl_before,
+            rss_dl_peak
+        );
+
+        // 3. 16 MiB streaming ZIP download
+        {
+            let mut st = lock_state(&state);
+            st.zip_roots = vec![zip_dir.clone()];
+        }
+        let t_zip_start = Instant::now();
+        let ticks_zip_0 = read_proc_cpu_ticks();
+        let (rss_zip_before, _) = read_proc_rss_kb();
+        let mut zip_stream = std::net::TcpStream::connect(("127.0.0.1", port)).unwrap();
+        zip_stream
+            .set_read_timeout(Some(Duration::from_secs(10)))
+            .unwrap();
+        let zreq = format!(
+            "GET /{}/download-all.zip HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n",
+            token
+        );
+        zip_stream.write_all(zreq.as_bytes()).unwrap();
+        let mut zip_rx = 0usize;
+        let mut rss_zip_peak = rss_zip_before;
+        loop {
+            let n = zip_stream.read(&mut rbuf).unwrap();
+            if n == 0 {
+                break;
+            }
+            zip_rx += n;
+            let (cur_rss, _) = read_proc_rss_kb();
+            if cur_rss > rss_zip_peak {
+                rss_zip_peak = cur_rss;
+            }
+        }
+        let zip_elapsed = t_zip_start.elapsed();
+        let ticks_zip = read_proc_cpu_ticks().saturating_sub(ticks_zip_0);
+        assert!(zip_rx > 16 * 1024 * 1024);
+        assert!(
+            rss_zip_peak.saturating_sub(rss_zip_before) < 8192,
+            "streaming ZIP RSS grew too much: {} KiB -> {} KiB",
+            rss_zip_before,
+            rss_zip_peak
+        );
+
+        // 4. 32 MiB streaming upload
+        {
+            let mut st = lock_state(&state);
+            st.mode = "receive".to_string();
+            st.dest_dir = upload_dir.clone();
+        }
+        let t_up_start = Instant::now();
+        let ticks_up_0 = read_proc_cpu_ticks();
+        let (rss_up_before, _) = read_proc_rss_kb();
+        let mut up_stream = std::net::TcpStream::connect(("127.0.0.1", port)).unwrap();
+        up_stream
+            .set_read_timeout(Some(Duration::from_secs(10)))
+            .unwrap();
+        let up_bytes_len = 32usize * 1024 * 1024;
+        let up_hdr = format!(
+            "POST /{}/upload?name=stream32m.bin HTTP/1.1\r\nHost: localhost\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+            token, up_bytes_len
+        );
+        up_stream.write_all(up_hdr.as_bytes()).unwrap();
+        let wbuf = vec![0x3Cu8; 64 * 1024];
+        let mut rss_up_peak = rss_up_before;
+        for _ in 0..(up_bytes_len / wbuf.len()) {
+            up_stream.write_all(&wbuf).unwrap();
+        }
+        let (up_status, _, _) = read_response(&mut up_stream);
+        let (cur_rss, hwm_end) = read_proc_rss_kb();
+        if cur_rss > rss_up_peak {
+            rss_up_peak = cur_rss;
+        }
+        let up_elapsed = t_up_start.elapsed();
+        let ticks_up = read_proc_cpu_ticks().saturating_sub(ticks_up_0);
+        assert_eq!(up_status, 200);
+        assert_eq!(
+            std::fs::metadata(upload_dir.join("stream32m.bin"))
+                .unwrap()
+                .len(),
+            up_bytes_len as u64
+        );
+        assert!(
+            rss_up_peak.saturating_sub(rss_up_before) < 8192,
+            "streaming upload RSS grew too much: {} KiB -> {} KiB",
+            rss_up_before,
+            rss_up_peak
+        );
+
+        let dl_mb_s = 32.0 / dl_elapsed.as_secs_f64().max(1e-6);
+        let zip_mb_s = 16.0 / zip_elapsed.as_secs_f64().max(1e-6);
+        let up_mb_s = 32.0 / up_elapsed.as_secs_f64().max(1e-6);
+        eprintln!(
+            "[perf_profile] base_rss={}KB hwm={}KB idle_ticks={} | dl_32m={:.1}ms ({:.1} MB/s) rss_delta={}KB cpu_ticks={} | zip_16m={:.1}ms ({:.1} MB/s) rss_delta={}KB cpu_ticks={} | up_32m={:.1}ms ({:.1} MB/s) rss_delta={}KB cpu_ticks={}",
+            rss_base,
+            hwm_end,
+            ticks_idle,
+            dl_elapsed.as_secs_f64() * 1000.0,
+            dl_mb_s,
+            rss_dl_peak.saturating_sub(rss_dl_before),
+            ticks_dl,
+            zip_elapsed.as_secs_f64() * 1000.0,
+            zip_mb_s,
+            rss_zip_peak.saturating_sub(rss_zip_before),
+            ticks_zip,
+            up_elapsed.as_secs_f64() * 1000.0,
+            up_mb_s,
+            rss_up_peak.saturating_sub(rss_up_before),
+            ticks_up,
+        );
+
+        lock_state(&state).active = false;
+        handle.join().ok();
+    }
+
+    #[test]
+    fn inactivity_timeout_resets_on_transfer_and_expires_when_idle() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let token = "testtimeout";
+        let session = ServerSession::new(listener, port, token).unwrap();
+        let dest_dir = unique_temp_dir("inactivity_timeout");
+        std::fs::create_dir_all(&dest_dir).unwrap();
+        let _guard = TempDirGuard(dest_dir.clone());
+        let state = session.state.clone();
+        {
+            let mut st = lock_state(&state);
+            st.mode = "receive".to_string();
+            st.dest_dir = dest_dir.clone();
+            st.timeout_secs = Some(1); // 1 second timeout
+        }
+
+        let handle = thread::spawn(move || {
+            let _ = session.run();
+        });
+
+        // Wait for server to start
+        thread::sleep(Duration::from_millis(50));
+
+        // Verify server is active initially
         assert!(lock_state(&state).active);
-        assert_eq!(lock_state(&state).downloads_completed, 0);
 
-        // Final range 4-15 reaches byte 15 (file_len - 1), completing the download.
-        let client2 = std::thread::spawn(move || download_request(addr, token, 0, Some("bytes=4-15")));
-        let mut stream = accept_download(&listener);
-        serve_download(
-            &mut stream,
-            &format!("/{}/download/0/video.mp4", token),
-            &state,
-            &share_paths,
-            true,
-            None,
-            Some("bytes=4-15".to_string()),
-        )
-        .expect("serve final");
-        drop(stream);
-        let (s2, _, b2) = client2.join().expect("join2");
-        assert_eq!(s2, 206);
-        assert_eq!(b2, b"456789ABCDEF");
+        // Wait ~600ms, then do a small upload to reset the timer
+        thread::sleep(Duration::from_millis(600));
+
+        // Small upload should reset the inactivity timer
+        let (status, _) = http_post_upload(port, &token, "reset.txt", b"reset");
+        assert_eq!(status, 200);
+
+        // Wait another 600ms (total ~1.2s elapsed since start, but only ~600ms since upload)
+        thread::sleep(Duration::from_millis(600));
+
+        // Server should still be active because upload reset the timer
+        assert!(lock_state(&state).active);
+
+        // Now wait for timeout to expire (1 second after last activity)
+        thread::sleep(Duration::from_millis(1100));
+
+        // Server should now be inactive
         assert!(!lock_state(&state).active);
-        assert_eq!(lock_state(&state).downloads_completed, 1);
+
+        handle.join().ok();
     }
 
     #[test]
-    fn escape_json_escapes_control_characters() {
-        assert_eq!(escape_json("a\nb\rc\t\"d\\"), "a\\nb\\rc\\t\\\"d\\\\");
-        assert_eq!(escape_json("\u{0007}"), "\\u0007");
+    fn upload_accepts_chunked_transfer_encoding() {
+        let (token, port, handle, state) = start_test_server();
+        let dest_dir = unique_temp_dir("chunked_upload");
+        std::fs::create_dir_all(&dest_dir).unwrap();
+        let _guard = TempDirGuard(dest_dir.clone());
+        {
+            let mut st = lock_state(&state);
+            st.mode = "receive".to_string();
+            st.dest_dir = dest_dir.clone();
+        }
+        thread::sleep(Duration::from_millis(50));
+
+        // Send chunked upload: 3 chunks
+        let mut stream = TcpStream::connect(("127.0.0.1", port)).unwrap();
+        stream
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .unwrap();
+        let payload = b"hello chunked world";
+        let req = format!(
+            "POST /{}/upload?name=chunked.bin HTTP/1.1\r\n\
+             Host: localhost\r\n\
+             Transfer-Encoding: chunked\r\n\
+             Connection: close\r\n\
+             \r\n",
+            token
+        );
+        stream.write_all(req.as_bytes()).unwrap();
+        // Send chunks that match payload
+        let chunks: &[&[u8]] = &[b"hello chunked world"];
+        for chunk in chunks {
+            let chunk_line = format!("{:x};source=test\r\n", chunk.len());
+            stream.write_all(chunk_line.as_bytes()).unwrap();
+            stream.write_all(chunk).unwrap();
+            stream.write_all(b"\r\n").unwrap();
+        }
+        // Final chunk (0)
+        stream
+            .write_all(b"0\r\nX-Checksum: present\r\n\r\n")
+            .unwrap();
+
+        let (status, body, _) = read_response(&mut stream);
+        assert_eq!(
+            status,
+            200,
+            "Upload should succeed: {:?}",
+            String::from_utf8_lossy(&body)
+        );
+
+        // Verify file was created with exact content
+        let files: Vec<_> = std::fs::read_dir(&dest_dir).unwrap().collect();
+        assert_eq!(files.len(), 1);
+        let content = std::fs::read(files[0].as_ref().unwrap().path()).unwrap();
+        assert_eq!(content, payload);
+
+        // Verify session state
+        {
+            let st = lock_state(&state);
+            assert_eq!(st.uploads_received, 1);
+            assert_eq!(st.files, vec!["chunked.bin"]);
+        }
+
+        // No .part files should remain
+        let part_files: Vec<_> = std::fs::read_dir(&dest_dir)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .filter(|e| e.file_name().to_string_lossy().ends_with(".lanbeam.part"))
+            .collect();
+        assert_eq!(part_files.len(), 0);
+
+        // Stop server
+        let mut stream2 = TcpStream::connect(("127.0.0.1", port)).unwrap();
+        let stop_req = format!(
+            "POST /{}/stop HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n",
+            token
+        );
+        stream2.write_all(stop_req.as_bytes()).unwrap();
+        let _ = read_response(&mut stream2);
+
+        handle.join().unwrap();
+        let _ = std::fs::remove_dir_all(&dest_dir);
+    }
+
+    #[test]
+    fn upload_chunked_rejects_premature_eof_and_cleans_part_file() {
+        let (token, port, handle, state) = start_test_server();
+        let dest_dir = unique_temp_dir("chunked_eof");
+        std::fs::create_dir_all(&dest_dir).unwrap();
+        let _guard = TempDirGuard(dest_dir.clone());
+        {
+            let mut st = lock_state(&state);
+            st.mode = "receive".to_string();
+            st.dest_dir = dest_dir.clone();
+        }
+        thread::sleep(Duration::from_millis(50));
+
+        // Send chunked upload with truncated body (missing final 0 chunk)
+        let mut stream = TcpStream::connect(("127.0.0.1", port)).unwrap();
+        stream
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .unwrap();
+        let req = format!(
+            "POST /{}/upload?name=truncated.bin HTTP/1.1\r\n\
+             Host: localhost\r\n\
+             Transfer-Encoding: chunked\r\n\
+             Connection: close\r\n\
+             \r\n",
+            token
+        );
+        stream.write_all(req.as_bytes()).unwrap();
+        // Send one chunk
+        let chunk = b"partial data";
+        let chunk_line = format!("{:x}\r\n", chunk.len());
+        stream.write_all(chunk_line.as_bytes()).unwrap();
+        stream.write_all(chunk).unwrap();
+        stream.write_all(b"\r\n").unwrap();
+        // Don't send final 0 chunk - close write half
+        stream.shutdown(std::net::Shutdown::Write).unwrap();
+
+        let (status, _, _) = read_response(&mut stream);
+        assert_eq!(status, 400, "Should reject truncated chunked upload");
+
+        // No .part files should remain
+        let part_files: Vec<_> = std::fs::read_dir(&dest_dir)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .filter(|e| e.file_name().to_string_lossy().ends_with(".lanbeam.part"))
+            .collect();
+        assert_eq!(part_files.len(), 0, "No .part files should remain");
+
+        // Stop server
+        let mut stream2 = TcpStream::connect(("127.0.0.1", port)).unwrap();
+        let stop_req = format!(
+            "POST /{}/stop HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n",
+            token
+        );
+        stream2.write_all(stop_req.as_bytes()).unwrap();
+        let _ = read_response(&mut stream2);
+
+        handle.join().unwrap();
+        let _ = std::fs::remove_dir_all(&dest_dir);
+    }
+
+    #[test]
+    fn serve_text_accepts_chunked_transfer_encoding() {
+        let (token, port, handle, state) = start_test_server();
+        let dest_dir = unique_temp_dir("chunked_text");
+        std::fs::create_dir_all(&dest_dir).unwrap();
+        let _guard = TempDirGuard(dest_dir.clone());
+        {
+            let mut st = lock_state(&state);
+            st.mode = "text".to_string();
+        }
+        thread::sleep(Duration::from_millis(50));
+
+        // Send chunked text message
+        let mut stream = TcpStream::connect(("127.0.0.1", port)).unwrap();
+        stream
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .unwrap();
+        let text = "hello chunked";
+        let req = format!(
+            "POST /{}/text HTTP/1.1\r\n\
+             Host: localhost\r\n\
+             Transfer-Encoding: chunked\r\n\
+             Connection: close\r\n\
+             \r\n",
+            token
+        );
+        stream.write_all(req.as_bytes()).unwrap();
+        // Send body in chunks
+        let body_str = format!("{{\"text\":\"{}\"}}", text);
+        let body_chunks: &[&[u8]] = &[body_str.as_bytes()];
+        for chunk in body_chunks {
+            let chunk_line = format!("{:x}\r\n", chunk.len());
+            stream.write_all(chunk_line.as_bytes()).unwrap();
+            stream.write_all(chunk).unwrap();
+            stream.write_all(b"\r\n").unwrap();
+        }
+        stream.write_all(b"0\r\n\r\n").unwrap();
+
+        let (status, _body, _) = read_response(&mut stream);
+        assert_eq!(status, 200);
+
+        // Verify text was stored
+        {
+            let st = lock_state(&state);
+            assert_eq!(st.shared_text.as_deref(), Some(text));
+        }
+
+        // Stop server
+        let mut stream2 = TcpStream::connect(("127.0.0.1", port)).unwrap();
+        let stop_req = format!(
+            "POST /{}/stop HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n",
+            token
+        );
+        stream2.write_all(stop_req.as_bytes()).unwrap();
+        let _ = read_response(&mut stream2);
+
+        handle.join().unwrap();
+        let _ = std::fs::remove_dir_all(&dest_dir);
+    }
+
+    #[test]
+    fn chunked_text_enforces_limit_and_rejects_ambiguous_framing() {
+        let (token, port, handle, state) = start_test_server();
+        thread::sleep(Duration::from_millis(50));
+
+        let mut oversized = TcpStream::connect(("127.0.0.1", port)).unwrap();
+        oversized
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .unwrap();
+        let req = format!(
+            "POST /{}/text HTTP/1.1\r\nHost: localhost\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n10001\r\n",
+            token
+        );
+        oversized.write_all(req.as_bytes()).unwrap();
+        let (status, _, _) = read_response(&mut oversized);
+        assert_eq!(status, 413);
+
+        let mut ambiguous = TcpStream::connect(("127.0.0.1", port)).unwrap();
+        ambiguous
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .unwrap();
+        let req = format!(
+            "POST /{}/text HTTP/1.1\r\nHost: localhost\r\nTransfer-Encoding: chunked\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+            token
+        );
+        ambiguous.write_all(req.as_bytes()).unwrap();
+        let (status, _, _) = read_response(&mut ambiguous);
+        assert_eq!(status, 400);
+
+        let mut stop = TcpStream::connect(("127.0.0.1", port)).unwrap();
+        let req = format!(
+            "POST /{}/stop HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n",
+            token
+        );
+        stop.write_all(req.as_bytes()).unwrap();
+        let _ = read_response(&mut stop);
+        handle.join().unwrap();
+        assert_eq!(lock_state(&state).shared_text, None);
+    }
+
+    #[test]
+    fn chunked_body_processes_large_chunks_in_bounded_slices() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let payload = vec![b'x'; 256 * 1024];
+        let client_payload = payload.clone();
+        let client = thread::spawn(move || {
+            let mut stream = TcpStream::connect(address).unwrap();
+            write!(stream, "{:x}\r\n", client_payload.len()).unwrap();
+            stream.write_all(&client_payload).unwrap();
+            stream.write_all(b"\r\n0\r\n\r\n").unwrap();
+        });
+
+        let (mut stream, _) = listener.accept().unwrap();
+        let state = Arc::new(Mutex::new(SessionState::default()));
+        let mut received = 0usize;
+        let mut largest_slice = 0usize;
+        let total = read_chunked_body(&mut stream, &[], &state, 512 * 1024, |slice| {
+            received += slice.len();
+            largest_slice = largest_slice.max(slice.len());
+            Ok(())
+        })
+        .unwrap();
+        client.join().unwrap();
+
+        assert_eq!(total, payload.len() as u64);
+        assert_eq!(received, payload.len());
+        assert!(largest_slice <= 64 * 1024, "slice size was {largest_slice}");
+    }
+
+    struct TempDirGuard(std::path::PathBuf);
+    impl Drop for TempDirGuard {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
     }
 }

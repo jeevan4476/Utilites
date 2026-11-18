@@ -4,6 +4,7 @@
 export type LanbeamMode = "send" | "receive" | "text";
 
 export interface SessionState {
+  token?: string;
   mode: LanbeamMode;
   url: string;
   files: string[];
@@ -16,10 +17,13 @@ export interface SessionState {
 
 export interface FileInfo {
   name: string;
+  index: number;
   size: number;
   downloaded: boolean;
   progress: number; // 0..100
   status: "pending" | "downloading" | "done" | "error";
+  speed?: number; // bytes per second
+  eta?: string; // formatted ETA
 }
 
 export interface UploadInfo {
@@ -28,6 +32,8 @@ export interface UploadInfo {
   uploaded: number;
   progress: number; // 0..100
   status: "queued" | "uploading" | "done" | "error";
+  speed?: number; // bytes per second
+  eta?: string; // formatted ETA
 }
 
 export interface AppState {

@@ -53,7 +53,9 @@ impl Parser {
             self.args.remove(0);
         }
 
-        let subcommand = self.next_arg().ok_or_else(|| "expected a subcommand".to_string())?;
+        let subcommand = self
+            .next_arg()
+            .ok_or_else(|| "expected a subcommand".to_string())?;
 
         match subcommand.as_str() {
             "send" => self.parse_send(),
@@ -133,7 +135,9 @@ impl Parser {
 
         while let Some(arg) = self.next_arg() {
             match arg.as_str() {
-                "--dest" => dest = Some(PathBuf::from(self.take_required_value("--dest", "<DIR>")?)),
+                "--dest" => {
+                    dest = Some(PathBuf::from(self.take_required_value("--dest", "<DIR>")?))
+                }
                 "--port" => port = self.parse_port()?,
                 "--timeout" => timeout = self.parse_timeout()?,
                 "--max-uploads" => max_uploads = self.parse_max_uploads()?,
@@ -200,42 +204,51 @@ impl Parser {
             return Err("qr requires <text_or_url>".to_string());
         }
 
-        Ok(Command::Qr {
-            text_or_url,
-            svg,
-        })
+        Ok(Command::Qr { text_or_url, svg })
     }
 
     fn parse_port(&mut self) -> Result<Option<u16>, String> {
         match self.take_flag_value("--port", "port")? {
-            Some(v) => Ok(Some(v.parse::<u16>().map_err(|_| "invalid port".to_string())?)),
+            Some(v) => Ok(Some(
+                v.parse::<u16>().map_err(|_| "invalid port".to_string())?,
+            )),
             None => Ok(None),
         }
     }
 
     fn parse_timeout(&mut self) -> Result<Option<u64>, String> {
         match self.take_flag_value("--timeout", "timeout")? {
-            Some(v) => Ok(Some(v.parse::<u64>().map_err(|_| "invalid timeout".to_string())?)),
+            Some(v) => Ok(Some(
+                v.parse::<u64>()
+                    .map_err(|_| "invalid timeout".to_string())?,
+            )),
             None => Ok(None),
         }
     }
 
     fn parse_max_downloads(&mut self) -> Result<Option<u32>, String> {
         match self.take_flag_value("--max-downloads", "max-downloads")? {
-            Some(v) => Ok(Some(v.parse::<u32>().map_err(|_| "invalid max-downloads".to_string())?)),
+            Some(v) => Ok(Some(
+                v.parse::<u32>()
+                    .map_err(|_| "invalid max-downloads".to_string())?,
+            )),
             None => Ok(None),
         }
     }
 
     fn parse_max_uploads(&mut self) -> Result<Option<u32>, String> {
         match self.take_flag_value("--max-uploads", "max-uploads")? {
-            Some(v) => Ok(Some(v.parse::<u32>().map_err(|_| "invalid max-uploads".to_string())?)),
+            Some(v) => Ok(Some(
+                v.parse::<u32>()
+                    .map_err(|_| "invalid max-uploads".to_string())?,
+            )),
             None => Ok(None),
         }
     }
 
     fn take_required_value(&mut self, flag: &str, what: &str) -> Result<String, String> {
-        self.take_flag_value(flag, what)?.ok_or_else(|| format!("{flag} requires a {what} value"))
+        self.take_flag_value(flag, what)?
+            .ok_or_else(|| format!("{flag} requires a {what} value"))
     }
 }
 
@@ -285,11 +298,31 @@ mod tests {
     #[test]
     fn send_multiple_paths_and_flags() {
         let cmd = parse(&[
-            "lanbeam", "send", "/a.txt", "/b.txt", "--port", "8080", "--timeout", "30",
-            "--once", "--max-downloads", "5", "--gui", "--json",
-        ]).unwrap();
+            "lanbeam",
+            "send",
+            "/a.txt",
+            "/b.txt",
+            "--port",
+            "8080",
+            "--timeout",
+            "30",
+            "--once",
+            "--max-downloads",
+            "5",
+            "--gui",
+            "--json",
+        ])
+        .unwrap();
         match cmd {
-            Command::Send { paths, port, timeout, once, max_downloads, gui, json } => {
+            Command::Send {
+                paths,
+                port,
+                timeout,
+                once,
+                max_downloads,
+                gui,
+                json,
+            } => {
                 assert_eq!(paths.len(), 2);
                 assert_eq!(port, Some(8080));
                 assert_eq!(timeout, Some(30));
@@ -318,7 +351,14 @@ mod tests {
     fn receive_with_dest() {
         let cmd = parse(&["lanbeam", "receive", "--dest", "/tmp/recv"]).unwrap();
         match cmd {
-            Command::Receive { dest, port, timeout, max_uploads, gui, json } => {
+            Command::Receive {
+                dest,
+                port,
+                timeout,
+                max_uploads,
+                gui,
+                json,
+            } => {
                 assert_eq!(dest, Some(std::path::PathBuf::from("/tmp/recv")));
                 assert_eq!(port, None);
                 assert_eq!(timeout, None);
@@ -333,11 +373,29 @@ mod tests {
     #[test]
     fn receive_all_flags() {
         let cmd = parse(&[
-            "lanbeam", "receive", "--dest", "/d", "--port", "9000", "--timeout", "60",
-            "--max-uploads", "10", "--gui", "--json",
-        ]).unwrap();
+            "lanbeam",
+            "receive",
+            "--dest",
+            "/d",
+            "--port",
+            "9000",
+            "--timeout",
+            "60",
+            "--max-uploads",
+            "10",
+            "--gui",
+            "--json",
+        ])
+        .unwrap();
         match cmd {
-            Command::Receive { dest, port, timeout, max_uploads, gui, json } => {
+            Command::Receive {
+                dest,
+                port,
+                timeout,
+                max_uploads,
+                gui,
+                json,
+            } => {
                 assert_eq!(dest, Some(std::path::PathBuf::from("/d")));
                 assert_eq!(port, Some(9000));
                 assert_eq!(timeout, Some(60));
@@ -362,7 +420,13 @@ mod tests {
     fn text_from_clipboard() {
         let cmd = parse(&["lanbeam", "text", "--from-clipboard", "--once", "--gui"]).unwrap();
         match cmd {
-            Command::Text { text, from_clipboard, once, gui, .. } => {
+            Command::Text {
+                text,
+                from_clipboard,
+                once,
+                gui,
+                ..
+            } => {
                 assert_eq!(text, None);
                 assert!(from_clipboard);
                 assert!(once);
@@ -434,9 +498,18 @@ mod tests {
 
     #[test]
     fn version_and_help_parse_as_success_commands() {
-        assert!(matches!(parse(&["lanbeam", "--version"]).unwrap(), Command::Version));
-        assert!(matches!(parse(&["lanbeam", "-V"]).unwrap(), Command::Version));
-        assert!(matches!(parse(&["lanbeam", "--help"]).unwrap(), Command::Help));
+        assert!(matches!(
+            parse(&["lanbeam", "--version"]).unwrap(),
+            Command::Version
+        ));
+        assert!(matches!(
+            parse(&["lanbeam", "-V"]).unwrap(),
+            Command::Version
+        ));
+        assert!(matches!(
+            parse(&["lanbeam", "--help"]).unwrap(),
+            Command::Help
+        ));
         assert!(matches!(parse(&["lanbeam", "-h"]).unwrap(), Command::Help));
     }
 }

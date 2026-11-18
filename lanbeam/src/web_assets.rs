@@ -502,7 +502,7 @@ footer {
       <div class="shared-text hidden" id="shared-text">
         <span class="label">Shared text</span>
         <span id="shared-text-body"></span>
-        <button class="copy-btn" data-action="copy-link">Copy</button>
+        <button class="copy-btn" data-action="copy-text">Copy</button>
       </div>
 
       <!-- Files to download -->
@@ -592,6 +592,14 @@ function extractFilename(path) {
 function clamp(value, min, max) {
   return Math.min(Math.max(value, min), max);
 }
+function resolveSessionToken(embeddedToken, pathToken) {
+  for (const candidate of [embeddedToken, pathToken]) {
+    const token = candidate?.trim() ?? "";
+    if (token && token !== "–" && token !== "-")
+      return token;
+  }
+  return "";
+}
 
 class LanbeamApi {
   baseUrl;
@@ -626,26 +634,49 @@ class LanbeamApi {
       body: JSON.stringify({ text })
     });
   }
+  async stopSession() {
+    await this.request("/stop", {
+      method: "POST"
+    });
+  }
 }
 
 class LanbeamUI {
   state;
   api;
   pollTimer = null;
-  lastBytes = 0;
-  lastTime = 0;
   els = {};
   constructor(token, baseUrl) {
+    const initialState = window.__LANBEAM_INITIAL_STATE__;
+    const embeddedToken = initialState?.token?.trim();
+    const pathToken = window.location?.pathname?.split("/").filter(Boolean)[0] || "";
+    const resolvedToken = resolveSessionToken(embeddedToken, pathToken) || token;
+    const cleanBase = baseUrl.replace(/\/+$/, "");
+    const rootBase = resolvedToken && cleanBase.endsWith(`/${resolvedToken}`) ? cleanBase.slice(0, -(resolvedToken.length + 1)) : cleanBase;
+    const apiBase = resolvedToken ? `${rootBase}/${resolvedToken}` : rootBase;
     this.state = {
-      token,
-      baseUrl,
-      session: null,
+      token: resolvedToken,
+      baseUrl: rootBase,
+      session: initialState ? {
+        token: resolvedToken || undefined,
+        mode: initialState.mode || "send",
+        url: initialState.url || "",
+        files: initialState.files || [],
+        downloads_completed: initialState.downloads_completed || 0,
+        uploads_received: initialState.uploads_received || 0,
+        shared_text: initialState.shared_text ?? null,
+        remaining_seconds: initialState.remaining_seconds || 0,
+        active: initialState.active ?? true
+      } : null,
       files: [],
       uploads: [],
       theme: "light",
       polling: false
     };
-    this.api = new LanbeamApi(baseUrl);
+    if (this.state.session) {
+      this.syncFilesFromSession(this.state.session);
+    }
+    this.api = new LanbeamApi(apiBase);
     this.initTheme();
   }
   start() {
@@ -656,7 +687,7 @@ class LanbeamUI {
   stop() {
     this.state.polling = false;
     if (this.pollTimer !== null) {
-      clearInterval(this.pollTimer);
+      clearTimeout(this.pollTimer);
       this.pollTimer = null;
     }
   }
@@ -666,23 +697,32 @@ class LanbeamUI {
     this.refreshStatus().catch((err) => {
       console.error("lanbeam: poll failed:", err);
     }).finally(() => {
-      this.pollTimer = window.setTimeout(() => this.poll(), 1000);
+      if (this.state.polling) {
+        this.pollTimer = window.setTimeout(() => this.poll(), 1000);
+      }
     });
   }
   async refreshStatus() {
     const session = await this.api.getStatus();
+    if (session.token) {
+      this.state.token = session.token;
+    }
     this.state.session = session;
     this.syncFilesFromSession(session);
     this.render();
+    if (!session.active) {
+      this.stop();
+    }
   }
   syncFilesFromSession(session) {
-    const byName = new Map(this.state.files.map((f) => [f.name, f]));
-    const next = session.files.map((name) => {
-      const existing = byName.get(name);
+    const byKey = new Map(this.state.files.map((f) => [`${f.index}:${f.name}`, f]));
+    const next = session.files.map((name, index) => {
+      const existing = byKey.get(`${index}:${name}`);
       if (existing)
         return existing;
       return {
         name,
+        index,
         size: 0,
         downloaded: false,
         progress: 0,
@@ -720,6 +760,7 @@ class LanbeamUI {
     const s = this.state.session;
     if (!s)
       return;
+    this.setText("session-token", this.state.token || s.token || "–");
     this.setText("session-url", s.url);
     this.setText("session-mode", s.mode.charAt(0).toUpperCase() + s.mode.slice(1));
     this.setText("session-active", s.active ? "Active" : "Inactive");
@@ -758,7 +799,13 @@ class LanbeamUI {
     nameCell.textContent = f.name;
     const sizeCell = document.createElement("div");
     sizeCell.className = "file-size";
-    sizeCell.textContent = f.size > 0 ? formatBytes(f.size) : "–";
+    let sizeText = f.size > 0 ? formatBytes(f.size) : "–";
+    if (f.speed !== undefined && f.speed > 0) {
+      sizeText += ` · ${formatSpeed(f.speed)}`;
+      if (f.eta)
+        sizeText += ` · ETA ${f.eta}`;
+    }
+    sizeCell.textContent = sizeText;
     const progCell = document.createElement("div");
     progCell.className = "file-progress";
     const bar = document.createElement("div");
@@ -811,7 +858,13 @@ class LanbeamUI {
     nameCell.textContent = u.name;
     const sizeCell = document.createElement("div");
     sizeCell.className = "upload-size";
-    sizeCell.textContent = `${formatBytes(u.uploaded)} / ${formatBytes(u.size)}`;
+    let sizeText = `${formatBytes(u.uploaded)} / ${formatBytes(u.size)}`;
+    if (u.speed !== undefined && u.speed > 0) {
+      sizeText += ` · ${formatSpeed(u.speed)}`;
+      if (u.eta)
+        sizeText += ` · ETA ${u.eta}`;
+    }
+    sizeCell.textContent = sizeText;
     const progCell = document.createElement("div");
     progCell.className = "upload-progress";
     const bar = document.createElement("div");
@@ -826,49 +879,119 @@ class LanbeamUI {
     row.appendChild(progCell);
     return row;
   }
+  activeToken() {
+    return this.state.token || this.state.session?.token || "";
+  }
   async downloadFile(file) {
-    if (!this.state.session)
+    const token = this.activeToken();
+    if (!token)
       return;
-    const { token } = this.state.session;
-    const url = `${this.state.baseUrl}/${token}/download/${encodeURIComponent(file.name)}`;
+    const encodedName = file.name.split("/").map(encodeURIComponent).join("/");
+    const url = `${this.state.baseUrl}/${token}/download/${file.index}/${encodedName}`;
+    let reader;
     try {
       file.status = "downloading";
       file.progress = 0;
       this.renderFiles();
       const res = await fetch(url);
-      const blob = await res.blob();
-      const downloadUrl = URL.createObjectURL(blob);
-      const a = document.createElement("a");
-      a.href = downloadUrl;
-      a.download = file.name;
-      document.body.appendChild(a);
-      a.click();
-      document.body.removeChild(a);
-      URL.revokeObjectURL(downloadUrl);
+      if (!res.ok) {
+        throw new Error(`HTTP ${res.status}`);
+      }
+      const contentLength = Number(res.headers?.get("Content-Length"));
+      if ((!Number.isFinite(file.size) || file.size <= 0) && Number.isFinite(contentLength) && contentLength > 0) {
+        file.size = contentLength;
+      }
+      if (res.body && typeof res.body.getReader === "function") {
+        reader = res.body.getReader();
+        const chunks = [];
+        let received = 0;
+        let lastTime = Date.now();
+        let lastReceived = 0;
+        while (true) {
+          const { done, value } = await reader.read();
+          if (done)
+            break;
+          const chunkCopy = new Uint8Array(value.byteLength);
+          chunkCopy.set(value);
+          chunks.push(chunkCopy.buffer);
+          received += value.length;
+          if (file.size > 0) {
+            file.progress = clamp(Math.round(received / file.size * 100), 0, 100);
+          }
+          const now = Date.now();
+          const dt = (now - lastTime) / 1000;
+          if (dt > 0) {
+            file.speed = Math.round((received - lastReceived) / dt);
+            const remaining = Math.max(0, (file.size || 0) - received);
+            file.eta = formatETA(remaining, file.speed);
+          }
+          lastReceived = received;
+          lastTime = now;
+          this.renderFiles();
+        }
+        const blob = new Blob(chunks);
+        const downloadUrl = URL.createObjectURL(blob);
+        try {
+          const a = document.createElement("a");
+          a.href = downloadUrl;
+          a.download = extractFilename(file.name);
+          document.body.appendChild(a);
+          a.click();
+          document.body.removeChild(a);
+        } finally {
+          URL.revokeObjectURL(downloadUrl);
+        }
+      } else {
+        const blob = await res.blob();
+        const downloadUrl = URL.createObjectURL(blob);
+        try {
+          const a = document.createElement("a");
+          a.href = downloadUrl;
+          a.download = extractFilename(file.name);
+          document.body.appendChild(a);
+          a.click();
+          document.body.removeChild(a);
+        } finally {
+          URL.revokeObjectURL(downloadUrl);
+        }
+      }
       file.status = "done";
       file.progress = 100;
       file.downloaded = true;
+      file.speed = undefined;
+      file.eta = undefined;
     } catch (err) {
+      if (reader) {
+        try {
+          await reader.cancel();
+        } catch {}
+      }
       file.status = "error";
+      file.speed = undefined;
+      file.eta = undefined;
       console.error("lanbeam: download failed:", err);
     } finally {
       this.renderFiles();
     }
   }
   async openFile(file) {
-    if (!this.state.session)
+    const token = this.activeToken();
+    if (!token)
       return;
-    const { token } = this.state.session;
-    const url = `${this.state.baseUrl}/${token}/download/${encodeURIComponent(file.name)}`;
+    const encodedName = file.name.split("/").map(encodeURIComponent).join("/");
+    const url = `${this.state.baseUrl}/${token}/download/${file.index}/${encodedName}`;
     window.open(url, "_blank");
   }
   async downloadAll() {
-    if (!this.state.session)
+    const token = this.activeToken();
+    if (!token)
       return;
-    const { token } = this.state.session;
     const url = `${this.state.baseUrl}/${token}/download-all.zip`;
     try {
       const res = await fetch(url);
+      if (!res.ok) {
+        throw new Error(`HTTP ${res.status}`);
+      }
       const blob = await res.blob();
       const downloadUrl = URL.createObjectURL(blob);
       const a = document.createElement("a");
@@ -884,32 +1007,15 @@ class LanbeamUI {
     }
   }
   async queueUploads(files) {
-    if (!files)
+    if (!files || files.length === 0)
       return;
-    const arr = Array.from(files);
-    for (const file of arr) {
-      const up = {
-        name: file.name,
-        size: file.size,
-        uploaded: 0,
-        progress: 0,
-        status: "queued"
-      };
-      this.state.uploads.push(up);
+    for (const file of Array.from(files)) {
+      try {
+        await this.uploadFileWithProgress(file);
+      } catch (err) {
+        console.error("lanbeam: upload failed:", err);
+      }
     }
-    this.renderUploads();
-    for (const up of this.state.uploads) {
-      if (up.status !== "queued")
-        continue;
-      await this.performUpload(up);
-    }
-  }
-  performUpload(up) {
-    return new Promise((resolve) => {
-      const input = document.createElement("input");
-      input.type = "file";
-      resolve();
-    });
   }
   uploadFileWithProgress(file) {
     const up = {
@@ -922,19 +1028,40 @@ class LanbeamUI {
     this.state.uploads.push(up);
     this.renderUploads();
     return new Promise((resolve, reject) => {
-      if (!this.state.session) {
-        reject(new Error("no session"));
+      const token = this.activeToken();
+      if (!token) {
+        up.status = "error";
+        this.renderUploads();
+        reject(new Error("no session token"));
         return;
       }
-      const { token } = this.state.session;
       const url = `${this.state.baseUrl}/${token}/upload?name=${encodeURIComponent(up.name)}`;
       const xhr = new XMLHttpRequest;
-      xhr.open("POST", url, true);
+      try {
+        xhr.open("POST", url, true);
+      } catch (err) {
+        up.status = "error";
+        this.renderUploads();
+        reject(err);
+        return;
+      }
+      let lastBytes = 0;
+      let lastTime = Date.now();
       xhr.upload.addEventListener("progress", (ev) => {
         if (ev.lengthComputable) {
           up.uploaded = ev.loaded;
           up.size = ev.total;
-          up.progress = Math.round(ev.loaded / ev.total * 100);
+          up.progress = ev.total > 0 ? clamp(Math.round(ev.loaded / ev.total * 100), 0, 100) : 0;
+          const now = Date.now();
+          const dt = (now - lastTime) / 1000;
+          if (dt > 0 && ev.total > 0) {
+            const delta = ev.loaded - lastBytes;
+            up.speed = Math.round(delta / dt);
+            const remaining = Math.max(0, (up.size || 0) - ev.loaded);
+            up.eta = formatETA(remaining, up.speed);
+          }
+          lastBytes = ev.loaded;
+          lastTime = now;
           this.renderUploads();
         }
       });
@@ -943,20 +1070,41 @@ class LanbeamUI {
           up.status = "done";
           up.progress = 100;
           up.uploaded = up.size;
+          up.speed = undefined;
+          up.eta = undefined;
           this.renderUploads();
           resolve();
         } else {
           up.status = "error";
+          up.speed = undefined;
+          up.eta = undefined;
           this.renderUploads();
           reject(new Error(`Upload failed: ${xhr.status}`));
         }
       });
       xhr.addEventListener("error", () => {
         up.status = "error";
+        up.speed = undefined;
+        up.eta = undefined;
         this.renderUploads();
         reject(new Error("Upload network error"));
       });
-      xhr.send(file);
+      xhr.addEventListener("abort", () => {
+        up.status = "error";
+        up.speed = undefined;
+        up.eta = undefined;
+        this.renderUploads();
+        reject(new Error("Upload aborted"));
+      });
+      try {
+        xhr.send(file);
+      } catch (err) {
+        up.status = "error";
+        up.speed = undefined;
+        up.eta = undefined;
+        this.renderUploads();
+        reject(err);
+      }
     });
   }
   async sendTextFromUI(text) {
@@ -967,26 +1115,43 @@ class LanbeamUI {
       alert("Failed to send text.");
     }
   }
-  async copyLink() {
-    const url = this.state.session?.url;
-    if (!url)
+  async copyText(value, toastMessage) {
+    if (!value)
       return;
     try {
-      await navigator.clipboard.writeText(url);
-      this.showToast("Link copied to clipboard");
+      await navigator.clipboard.writeText(value);
+      this.showToast(toastMessage);
     } catch {
       const ta = document.createElement("textarea");
-      ta.value = url;
+      ta.value = value;
       ta.style.position = "fixed";
       ta.style.opacity = "0";
       document.body.appendChild(ta);
       ta.select();
       try {
         document.execCommand("copy");
-        this.showToast("Link copied to clipboard");
+        this.showToast(toastMessage);
       } finally {
         document.body.removeChild(ta);
       }
+    }
+  }
+  async copyLink() {
+    await this.copyText(this.state.session?.url || "", "Link copied to clipboard");
+  }
+  async copySharedText() {
+    await this.copyText(this.state.session?.shared_text || "", "Text copied to clipboard");
+  }
+  async stopSharing() {
+    try {
+      await this.api.stopSession();
+    } catch (err) {
+      console.error("lanbeam: stop session failed:", err);
+    }
+    this.stop();
+    if (this.state.session) {
+      this.state.session.active = false;
+      this.render();
     }
   }
   async shareText(text) {
@@ -1015,10 +1180,12 @@ class LanbeamUI {
     if (themeBtn) {
       themeBtn.addEventListener("click", () => this.toggleTheme());
     }
-    const copyBtn = root.querySelector('[data-action="copy-link"]');
-    if (copyBtn) {
-      copyBtn.addEventListener("click", () => this.copyLink());
-    }
+    root.querySelectorAll('[data-action="copy-link"]').forEach((btn) => {
+      btn.addEventListener("click", () => this.copyLink());
+    });
+    root.querySelectorAll('[data-action="copy-text"]').forEach((btn) => {
+      btn.addEventListener("click", () => this.copySharedText());
+    });
     const dlAllBtn = root.querySelector('[data-action="download-all"]');
     if (dlAllBtn) {
       dlAllBtn.addEventListener("click", () => this.downloadAll());
@@ -1059,7 +1226,7 @@ class LanbeamUI {
     const stopBtn = root.querySelector('[data-action="stop"]');
     if (stopBtn) {
       stopBtn.addEventListener("click", () => {
-        this.stop();
+        this.stopSharing();
       });
     }
   }
@@ -1071,23 +1238,17 @@ export {
   extractFilename,
   formatBytes,
   formatETA,
-  formatSpeed
+  formatSpeed,
+  resolveSessionToken
 };
 
 // --- initialization ---
-const token = document.getElementById("session-token");
-      const baseUrl = window.location.origin;
-
-      // The token is injected by the Rust backend into the page; fall back to
-      // reading it from the current URL path if embedded JSON is absent.
-      let sessionToken = "";
-      try {
-        const meta = document.getElementById("session-token");
-        // Token will be filled in by the backend at serve time.
-        sessionToken = meta ? (meta.textContent || "").trim() : "";
-      } catch {
-        sessionToken = "";
-      }
+const baseUrl = window.location.origin;
+      const initial = window.__LANBEAM_INITIAL_STATE__;
+      const pathToken = window.location.pathname.split("/").filter(Boolean)[0] || "";
+      const sessionToken = resolveSessionToken(initial?.token, pathToken);
+      const tokenChip = document.getElementById("session-token");
+      if (tokenChip) tokenChip.textContent = sessionToken || "–";
 
       const ui = new LanbeamUI(sessionToken || "demo", baseUrl);
       ui.wire(document.body);

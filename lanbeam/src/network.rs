@@ -36,7 +36,10 @@ pub fn bind_listener(host: IpAddr, preferred_port: u16) -> io::Result<(TcpListen
     }
 
     Err(last_err.unwrap_or_else(|| {
-        io::Error::new(io::ErrorKind::AddrNotAvailable, "no ports available in 1025..=65535")
+        io::Error::new(
+            io::ErrorKind::AddrNotAvailable,
+            "no ports available in 1025..=65535",
+        )
     }))
 }
 
@@ -111,7 +114,7 @@ mod tests {
         let ip = IpAddr::V4(Ipv4Addr::LOCALHOST);
         // Port 80 should be clamped upward to >= 1025.
         let (listener, port) = bind_listener(ip, 80).expect("bind localhost");
-        assert!(port >= 1025 && port <= 65535);
+        assert!(port >= 1025);
         drop(listener);
     }
 }

@@ -53,7 +53,7 @@
       <div class="shared-text hidden" id="shared-text">
         <span class="label">Shared text</span>
         <span id="shared-text-body"></span>
-        <button class="copy-btn" data-action="copy-link">Copy</button>
+        <button class="copy-btn" data-action="copy-text">Copy</button>
       </div>
 
       <!-- Files to download -->
@@ -102,21 +102,14 @@
     </footer>
 
     <script type="module">
-      import { LanbeamUI } from "./app.ts";
+      import { LanbeamUI, resolveSessionToken } from "./app.ts";
 
-      const token = document.getElementById("session-token");
       const baseUrl = window.location.origin;
-
-      // The token is injected by the Rust backend into the page; fall back to
-      // reading it from the current URL path if embedded JSON is absent.
-      let sessionToken = "";
-      try {
-        const meta = document.getElementById("session-token");
-        // Token will be filled in by the backend at serve time.
-        sessionToken = meta ? (meta.textContent || "").trim() : "";
-      } catch {
-        sessionToken = "";
-      }
+      const initial = window.__LANBEAM_INITIAL_STATE__;
+      const pathToken = window.location.pathname.split("/").filter(Boolean)[0] || "";
+      const sessionToken = resolveSessionToken(initial?.token, pathToken);
+      const tokenChip = document.getElementById("session-token");
+      if (tokenChip) tokenChip.textContent = sessionToken || "–";
 
       const ui = new LanbeamUI(sessionToken || "demo", baseUrl);
       ui.wire(document.body);
